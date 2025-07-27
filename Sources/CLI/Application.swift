@@ -272,12 +272,14 @@ struct Application: AsyncParsableCommand {
         guard #available(macOS 26, *) else {
             return [
                 BuilderCommand.self,
+                ComposeCommand.self,
                 SystemCommand.self,
             ]
         }
 
         return [
             BuilderCommand.self,
+            ComposeCommand.self,
             NetworkCommand.self,
             SystemCommand.self,
         ]
