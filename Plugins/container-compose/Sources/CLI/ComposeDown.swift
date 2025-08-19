@@ -41,6 +41,7 @@ struct ComposeDown: AsyncParsableCommand {
         
         func run() async throws {
         // Set environment variables
+        composeOptions.loadDotEnvIfPresent()
         composeOptions.setEnvironmentVariables()
         
         // Parse compose file
@@ -73,6 +74,7 @@ struct ComposeDown: AsyncParsableCommand {
         try await orchestrator.down(
             project: project,
             removeVolumes: volumes,
+            removeOrphans: removeOrphans,
             progressHandler: progress.handler
         )
         

@@ -311,8 +311,27 @@ public struct ProjectConverter {
             return finalMount
         }
         
-        // Get environment variables
-        let environment = service.environment?.asDictionary ?? [:]
+        // Load env_file entries and merge into environment
+        var environment = [String: String]()
+        if let envFile = service.envFile {
+            for path in envFile.asArray {
+                let url: URL
+                if path.hasPrefix("/") {
+                    url = URL(fileURLWithPath: path)
+                } else {
+                    let cwd = FileManager.default.currentDirectoryPath
+                    url = URL(fileURLWithPath: cwd).appendingPathComponent(path)
+                }
+                if let fileEnv = try? loadEnvFile(url: url) {
+                    // later files override earlier ones
+                    for (k, v) in fileEnv { environment[k] = v }
+                } else {
+                    log.warning("env_file not found or unreadable: \(path)")
+                }
+            }
+        }
+        // Service-level environment overrides env_file
+        for (k, v) in (service.environment?.asDictionary ?? [:]) { environment[k] = v }
         
         // Get networks
         let networks: [String] = {
@@ -326,23 +345,45 @@ public struct ProjectConverter {
             }
         }()
         
-        // Get dependencies
+        // Get dependencies and conditions
         let dependsOn = service.dependsOn?.asList ?? []
+        var dependsOnHealthy: [String] = []
+        var dependsOnStarted: [String] = []
+        var dependsOnCompleted: [String] = []
+        if case .dict(let dict) = service.dependsOn {
+            for (name, cfg) in dict {
+                switch cfg.condition?.lowercased() {
+                case "service_healthy": dependsOnHealthy.append(name)
+                case "service_started": dependsOnStarted.append(name)
+                case "service_completed_successfully": dependsOnCompleted.append(name)
+                default: break
+                }
+            }
+        }
         
         // Convert health check
         let healthCheck: HealthCheck? = {
             guard let hc = service.healthcheck, !(hc.disable ?? false) else { return nil }
             
-            // Get the test command
-            var testCommand = hc.test?.asArray ?? []
+            // Build the test command according to Compose spec
+            var testCommand: [String] = []
+            if let test = hc.test {
+                switch test {
+                case .list(let arr):
+                    testCommand = arr
+                case .string(let s):
+                    // String form is equivalent to CMD-SHELL
+                    testCommand = ["/bin/sh", "-c", s]
+                }
+            }
             
-            // Handle special cases
+            // Handle special tokens
             if !testCommand.isEmpty {
                 if testCommand[0] == "NONE" {
                     // NONE means no health check
                     return nil
                 } else if testCommand[0] == "CMD-SHELL" && testCommand.count > 1 {
-                    // Convert CMD-SHELL to shell command
+                    // Convert CMD-SHELL to shell invocation
                     let shellCommand = testCommand[1...].joined(separator: " ")
                     testCommand = ["/bin/sh", "-c", shellCommand]
                 }
@@ -375,6 +416,9 @@ public struct ProjectConverter {
             volumes: volumes,
             networks: networks,
             dependsOn: dependsOn,
+            dependsOnHealthy: dependsOnHealthy,
+            dependsOnStarted: dependsOnStarted,
+            dependsOnCompletedSuccessfully: dependsOnCompleted,
             healthCheck: healthCheck,
             deploy: convertDeploy(service.deploy),
             restart: service.restart,
@@ -497,5 +541,24 @@ public struct ProjectConverter {
         default:
             return nil
         }
+    }
+
+    private func loadEnvFile(url: URL) throws -> [String: String] {
+        let text = try String(contentsOf: url, encoding: .utf8)
+        var out: [String: String] = [:]
+        for rawLine in text.split(whereSeparator: { $0.isNewline }) {
+            var line = String(rawLine).trimmingCharacters(in: .whitespaces)
+            if line.isEmpty || line.hasPrefix("#") { continue }
+            if line.hasPrefix("export ") { line.removeFirst("export ".count) }
+            let parts = line.split(separator: "=", maxSplits: 1)
+            guard parts.count == 2 else { continue }
+            let key = String(parts[0]).trimmingCharacters(in: .whitespaces)
+            var val = String(parts[1]).trimmingCharacters(in: .whitespaces)
+            if (val.hasPrefix("\"") && val.hasSuffix("\"")) || (val.hasPrefix("'") && val.hasSuffix("'")) {
+                val = String(val.dropFirst().dropLast())
+            }
+            out[key] = val
+        }
+        return out
     }
 }

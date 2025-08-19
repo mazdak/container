@@ -165,4 +165,21 @@ struct HealthCheckTests {
         // NONE should result in no health check
         #expect(project.services["worker"]!.healthCheck == nil)
     }
+    
+    @Test func testProjectConverterHealthCheckStringToShell() throws {
+        let yaml = """
+        version: '3'
+        services:
+          api:
+            image: busybox
+            healthcheck:
+              test: "echo ok"
+        """
+        let parser = ComposeParser(log: log)
+        let composeFile = try parser.parse(from: yaml.data(using: .utf8)!)
+        let converter = ProjectConverter(log: log)
+        let project = try converter.convert(composeFile: composeFile, projectName: "test")
+        let hc = try #require(project.services["api"]?.healthCheck)
+        #expect(hc.test == ["/bin/sh", "-c", "echo ok"])
+    }
 }

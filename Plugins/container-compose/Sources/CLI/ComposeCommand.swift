@@ -47,39 +47,47 @@ struct ComposeOptions: ParsableArguments {
     }
     
     func getComposeFileURLs() -> [URL] {
-        // If no files specified, use default
-        let files = file.isEmpty ? ["docker-compose.yaml", "docker-compose.yml", "compose.yaml", "compose.yml"] : file
-        
-        var urls: [URL] = []
         let currentPath = FileManager.default.currentDirectoryPath
         
-        for fileName in files {
-            let url: URL
-            if fileName.hasPrefix("/") {
-                url = URL(fileURLWithPath: fileName)
-            } else {
-                url = URL(fileURLWithPath: currentPath).appendingPathComponent(fileName)
+        // If files were explicitly specified, return all of them (relative to cwd)
+        if !file.isEmpty {
+            return file.map { name in
+                if name.hasPrefix("/") { return URL(fileURLWithPath: name) }
+                return URL(fileURLWithPath: currentPath).appendingPathComponent(name)
             }
-            
-            // For default files, only add if they exist
-            if file.isEmpty {
-                if FileManager.default.fileExists(atPath: url.path) {
-                    urls.append(url)
-                    break // Use first found default file
+        }
+        
+        // Default behavior: detect base compose file and include matching override
+        let candidates = [
+            "docker-compose.yml",
+            "docker-compose.yaml",
+            "compose.yml",
+            "compose.yaml",
+        ]
+        
+        for base in candidates {
+            let baseURL = URL(fileURLWithPath: currentPath).appendingPathComponent(base)
+            if FileManager.default.fileExists(atPath: baseURL.path) {
+                var urls = [baseURL]
+                // Include override for the chosen base
+                let overrideCandidates: [String]
+                if base.hasPrefix("docker-compose") {
+                    overrideCandidates = ["docker-compose.override.yml", "docker-compose.override.yaml"]
+                } else {
+                    overrideCandidates = ["compose.override.yml", "compose.override.yaml"]
                 }
-            } else {
-                // For explicitly specified files, add them all (parser will check existence)
-                urls.append(url)
+                for o in overrideCandidates {
+                    let oURL = URL(fileURLWithPath: currentPath).appendingPathComponent(o)
+                    if FileManager.default.fileExists(atPath: oURL.path) {
+                        urls.append(oURL)
+                    }
+                }
+                return urls
             }
         }
         
-        // If no files found from defaults, return the first default for error message
-        if urls.isEmpty && file.isEmpty {
-            let defaultFile = URL(fileURLWithPath: currentPath).appendingPathComponent("docker-compose.yaml")
-            urls.append(defaultFile)
-        }
-        
-        return urls
+        // Nothing found: return a sensible default path for better error message downstream
+        return [URL(fileURLWithPath: currentPath).appendingPathComponent("docker-compose.yml")]
     }
     
     func setEnvironmentVariables() {
@@ -87,6 +95,30 @@ struct ComposeOptions: ParsableArguments {
             let parts = envVar.split(separator: "=", maxSplits: 1)
             if parts.count == 2 {
                 setenv(String(parts[0]), String(parts[1]), 1)
+            }
+        }
+    }
+
+    /// Load .env from current working directory and export vars into process env
+    /// Compose uses .env for interpolation; we approximate by exporting to env before parsing
+    func loadDotEnvIfPresent() {
+        let cwd = FileManager.default.currentDirectoryPath
+        let dotEnvURL = URL(fileURLWithPath: cwd).appendingPathComponent(".env")
+        guard FileManager.default.fileExists(atPath: dotEnvURL.path) else { return }
+        if let contents = try? String(contentsOf: dotEnvURL, encoding: .utf8) {
+            for line in contents.split(whereSeparator: { $0.isNewline }) {
+                var s = String(line).trimmingCharacters(in: .whitespaces)
+                if s.isEmpty || s.hasPrefix("#") { continue }
+                if s.hasPrefix("export ") { s.removeFirst("export ".count) }
+                let parts = s.split(separator: "=", maxSplits: 1)
+                if parts.count == 2 {
+                    let key = String(parts[0]).trimmingCharacters(in: .whitespaces)
+                    var val = String(parts[1]).trimmingCharacters(in: .whitespaces)
+                    if (val.hasPrefix("\"") && val.hasSuffix("\"")) || (val.hasPrefix("'") && val.hasSuffix("'")) {
+                        val = String(val.dropFirst().dropLast())
+                    }
+                    setenv(key, val, 1) // override to ensure deterministic interpolation in this process
+                }
             }
         }
     }

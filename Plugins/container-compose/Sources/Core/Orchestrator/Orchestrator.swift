@@ -28,6 +28,41 @@ import Glibc
 #endif
 import ContainerizationOCI
 
+// MARK: - HealthCheckRunner
+
+public protocol HealthCheckRunner: Sendable {
+    func execute(container: ClientContainer, healthCheck: HealthCheck, log: Logger) async -> Bool
+}
+
+public struct DefaultHealthCheckRunner: HealthCheckRunner {
+    public init() {}
+    public func execute(container: ClientContainer, healthCheck: HealthCheck, log: Logger) async -> Bool {
+        do {
+            let processId = "healthcheck-\(UUID().uuidString)"
+            let procConfig = ProcessConfiguration(
+                executable: healthCheck.test[0],
+                arguments: Array(healthCheck.test.dropFirst()),
+                environment: [],
+                workingDirectory: "/"
+            )
+            let process = try await container.createProcess(
+                id: processId,
+                configuration: procConfig,
+                stdio: [nil, nil, nil]
+            )
+            let timeoutSeconds = Int(healthCheck.timeout ?? 30)
+            try await process.start()
+            let exitCode = try await withTimeoutGlobal(seconds: timeoutSeconds) {
+                try await process.wait()
+            }
+            return exitCode == 0
+        } catch {
+            log.debug("Health check failed for container \(container.id): \(error)")
+            return false
+        }
+    }
+}
+
 /// Manages the lifecycle of services in a compose project.
 ///
 /// The Orchestrator is responsible for:
@@ -40,6 +75,9 @@ import ContainerizationOCI
 public actor Orchestrator {
     private let log: Logger
     private var projectState: [String: ProjectState] = [:]
+    private var healthMonitors: [String: [String: Task<Void, Never>]] = [:] // project -> service -> task
+    private var healthWaiters: [String: [String: [CheckedContinuation<Void, Error>]]] = [:]
+    private let healthRunner: HealthCheckRunner
     
     /// State of a project
     private struct ProjectState {
@@ -65,8 +103,9 @@ public actor Orchestrator {
         case starting  // health: starting - not yet healthy
     }
     
-    public init(log: Logger) {
+    public init(log: Logger, healthRunner: HealthCheckRunner = DefaultHealthCheckRunner()) {
         self.log = log
+        self.healthRunner = healthRunner
     }
     
     /// Start services in a project.
@@ -89,13 +128,23 @@ public actor Orchestrator {
         detach: Bool = false,
         forceRecreate: Bool = false,
         noRecreate: Bool = false,
+        noDeps: Bool = false,
+        removeOrphans: Bool = false,
         progressHandler: ProgressUpdateHandler? = nil
     ) async throws {
         log.info("Starting project '\(project.name)'")
         
-        // Filter services if specific ones requested
-        let targetServices = services.isEmpty ? project.services : 
-            DependencyResolver.filterWithDependencies(services: project.services, selected: services)
+        // Filter services based on selection and --no-deps
+        let targetServices: [String: Service]
+        if services.isEmpty {
+            targetServices = project.services
+        } else if noDeps {
+            // Only start the explicitly named services
+            targetServices = project.services.filter { services.contains($0.key) }
+        } else {
+            // Include dependencies
+            targetServices = DependencyResolver.filterWithDependencies(services: project.services, selected: services)
+        }
         
         // Resolve dependencies
         let resolution = try DependencyResolver.resolve(services: targetServices)
@@ -150,6 +199,12 @@ public actor Orchestrator {
             }
         }
         
+        // Optionally remove orphan containers not in current project services
+        if removeOrphans {
+            let keep = Set(targetServices.keys)
+            try await removeOrphanContainers(project: project, keepServices: keep)
+        }
+        
         log.info("Project '\(project.name)' started successfully")
     }
     
@@ -167,6 +222,7 @@ public actor Orchestrator {
     public func down(
         project: Project,
         removeVolumes: Bool = false,
+        removeOrphans: Bool = false,
         progressHandler: ProgressUpdateHandler? = nil
     ) async throws {
         log.info("Stopping project '\(project.name)'")
@@ -199,6 +255,19 @@ public actor Orchestrator {
             }
         }
         
+        // Cancel health monitors for this project
+        cancelHealthMonitors(projectName: project.name)
+
+        // Optionally remove volumes
+        if removeVolumes {
+            try await removeNamedVolumes(project: project, progressHandler: progressHandler)
+        }
+
+        // Optionally remove orphans remaining for this project prefix
+        if removeOrphans {
+            try await removeOrphanContainers(project: project, keepServices: Set(project.services.keys))
+        }
+
         // Clear project state
         projectState[project.name] = nil
         
@@ -241,9 +310,10 @@ public actor Orchestrator {
                         }
                     } else if container.status == RuntimeStatus.running {
                         // If running but no health state, execute a check
-                        let isHealthy = await executeHealthCheck(
+                        let isHealthy = await healthRunner.execute(
                             container: container,
-                            healthCheck: service.healthCheck!
+                            healthCheck: service.healthCheck!,
+                            log: log
                         )
                         statusText = "\(statusText) (\(isHealthy ? "healthy" : "unhealthy"))"
                     }
@@ -714,10 +784,33 @@ public actor Orchestrator {
         progressHandler: ProgressUpdateHandler?
     ) async throws {
         let containerName = service.containerName ?? "\(project.name)_\(service.name)"
-        
+
         await progressHandler?([
             .setDescription("Starting service '\(service.name)'")
         ])
+
+        // If this service requires dependencies to be started, wait for them
+        if !service.dependsOnStarted.isEmpty {
+            for dep in service.dependsOnStarted {
+                try await awaitServiceStarted(project: project, serviceName: dep, deadlineSeconds: 60)
+            }
+        }
+
+        // If this service requires dependencies to be healthy, wait for them
+        if !service.dependsOnHealthy.isEmpty {
+            for dep in service.dependsOnHealthy {
+                let deadline = computeHealthDeadline(healthCheck: project.services[dep]?.healthCheck)
+                try await awaitServiceHealthy(project: project, serviceName: dep, deadlineSeconds: deadline)
+            }
+        }
+
+        // If this service requires dependencies to complete successfully, wait for them
+        if !service.dependsOnCompletedSuccessfully.isEmpty {
+            for dep in service.dependsOnCompletedSuccessfully {
+                log.warning("depends_on condition 'service_completed_successfully' for '\(dep)' cannot verify exit code; will only wait until container stops")
+                try await awaitServiceCompleted(project: project, serviceName: dep, deadlineSeconds: 300)
+            }
+        }
         
         // Check if container already exists
         let existingContainer = try? await ClientContainer.get(id: containerName)
@@ -789,8 +882,12 @@ public actor Orchestrator {
         try await process.start()
         
         // Update status
-        projectState[project.name]!.containers[service.name]!.status = .running
-        
+        projectState[project.name]!.containers[service.name]!.status = service.healthCheck == nil ? .running : .starting
+
+        // Informative DNS log: services are reachable by their container ID
+        let dnsName = containerName
+        log.info("Service '\(service.name)' reachable via DNS name: \(dnsName)")
+
         // Check health if defined
         if let healthCheck = service.healthCheck {
             await progressHandler?([
@@ -803,17 +900,23 @@ public actor Orchestrator {
                 try await Task.sleep(nanoseconds: UInt64(startPeriod) * 1_000_000_000)
             }
             
-            // Execute initial health check
-            let isHealthy = await executeHealthCheck(
-                container: container,
-                healthCheck: healthCheck
-            )
-            
-            projectState[project.name]!.containers[service.name]!.status = isHealthy ? .healthy : .unhealthy
-            
-            if !isHealthy {
-                log.warning("Service '\(service.name)' failed initial health check")
+            // Execute health check with retries/interval (initial gating)
+            let attempts = max(1, (healthCheck.retries ?? 0) + 1)
+            var ok = false
+            for i in 1...attempts {
+                let isHealthy = await healthRunner.execute(container: container, healthCheck: healthCheck, log: log)
+                if isHealthy { ok = true; break }
+                if i < attempts {
+                    let interval = healthCheck.interval ?? 0
+                    if interval > 0 { try await Task.sleep(nanoseconds: UInt64(interval) * 1_000_000_000) }
+                }
             }
+            projectState[project.name]!.containers[service.name]!.status = ok ? .healthy : .unhealthy
+            if ok { notifyHealthy(projectName: project.name, serviceName: service.name) }
+            if !ok { log.warning("Service '\(service.name)' failed health checks") }
+
+            // Start background health monitor
+            startHealthMonitor(project: project, service: service, containerID: container.id, healthCheck: healthCheck)
         }
         
         await progressHandler?([
@@ -1021,6 +1124,23 @@ public actor Orchestrator {
             log.warning("Failed to stop/remove container '\(containerName)': \(error)")
         }
     }
+
+    /// Remove orphan containers that match the project's prefix but are not part of `keepServices`.
+    private func removeOrphanContainers(project: Project, keepServices: Set<String>) async throws {
+        let prefix = project.name + "_"
+        let containers = try await ClientContainer.list()
+        for c in containers {
+            guard c.id.hasPrefix(prefix) else { continue }
+            // infer service name from suffix
+            let serviceName = String(c.id.dropFirst(prefix.count))
+            if !keepServices.contains(serviceName) {
+                log.info("Removing orphan container '\(c.id)'")
+                do { try await c.delete() } catch {
+                    log.warning("Failed to remove orphan container '\(c.id)': \(error)")
+                }
+            }
+        }
+    }
     
     private func formatPorts(_ ports: [PortMapping]) -> String {
         return ports.map { port in
@@ -1041,61 +1161,145 @@ public actor Orchestrator {
     ///   - container: The container to check
     ///   - healthCheck: The health check configuration
     /// - Returns: `true` if the health check passed (exit code 0), `false` otherwise
-    private func executeHealthCheck(
-        container: ClientContainer,
-        healthCheck: HealthCheck
-    ) async -> Bool {
-        do {
-            // Create a process for the health check command
-            let processId = "healthcheck-\(UUID().uuidString)"
-            
-            let procConfig = ProcessConfiguration(
-                executable: healthCheck.test[0],
-                arguments: Array(healthCheck.test.dropFirst()),
-                environment: [],
-                workingDirectory: "/"
-            )
-            
-            let process = try await container.createProcess(
-                id: processId,
-                configuration: procConfig,
-                stdio: [nil, nil, nil]
-            )
-            
-            // Execute with timeout
-            let timeoutSeconds = Int(healthCheck.timeout ?? 30)
-            
-            // Start process and wait for completion
-            try await process.start()
-            
-            // Wait with timeout
-            let exitCode = try await withTimeout(seconds: timeoutSeconds) {
-                try await process.wait()
+    // Background health monitor
+    private func startHealthMonitor(project: Project, service: Service, containerID: String, healthCheck: HealthCheck) {
+        let projName = project.name
+        var serviceMap = healthMonitors[projName] ?? [:]
+        // Cancel existing
+        if let existing = serviceMap[service.name] { existing.cancel() }
+        let task = Task.detached { [weak self] in
+            guard let self else { return }
+            do {
+                // Wait for start_period already handled; begin periodic checks
+                var consecutiveFailures = 0
+                while true {
+                    // Check container is still present and running
+                    guard let container = try? await ClientContainer.get(id: containerID) else { return }
+                    if container.status != RuntimeStatus.running { return }
+
+                    let ok = await self.healthRunner.execute(container: container, healthCheck: healthCheck, log: self.log)
+                    await self.updateHealthStatus(projectName: projName, serviceName: service.name, healthy: ok, retries: healthCheck.retries ?? 0)
+                    if ok { consecutiveFailures = 0 } else {
+                        consecutiveFailures += 1
+                    }
+                    let interval = max(1, Int(healthCheck.interval ?? 30))
+                    try await Task.sleep(nanoseconds: UInt64(interval) * 1_000_000_000)
+                }
+            } catch {
+                // Container listing or sleep failed; end monitor
+                return
             }
-            
-            return exitCode == 0
-        } catch {
-            log.debug("Health check failed for container \(container.id): \(error)")
-            return false
+        }
+        serviceMap[service.name] = task
+        healthMonitors[projName] = serviceMap
+    }
+
+    private func cancelHealthMonitors(projectName: String) {
+        guard let map = healthMonitors[projectName] else { return }
+        for (_, task) in map { task.cancel() }
+        healthMonitors[projectName] = [:]
+    }
+
+    private func updateHealthStatus(projectName: String, serviceName: String, healthy: Bool, retries: Int) {
+        if var state = projectState[projectName], var container = state.containers[serviceName] {
+            container.status = healthy ? .healthy : .unhealthy
+            state.containers[serviceName] = container
+            projectState[projectName] = state
+            if healthy { notifyHealthy(projectName: projectName, serviceName: serviceName) }
         }
     }
-    
-    /// Helper function to execute with timeout
-    private func withTimeout<T: Sendable>(seconds: Int, operation: @escaping @Sendable () async throws -> T) async throws -> T {
-        try await withThrowingTaskGroup(of: T.self) { group in
-            group.addTask {
-                try await operation()
-            }
-            
-            group.addTask {
-                try await Task.sleep(nanoseconds: UInt64(seconds) * 1_000_000_000)
-                throw ContainerizationError(.timeout, message: "Operation timed out after \(seconds) seconds")
-            }
-            
-            let result = try await group.next()!
-            group.cancelAll()
-            return result
+
+    private func notifyHealthy(projectName: String, serviceName: String) {
+        guard var services = healthWaiters[projectName], var list = services[serviceName] else { return }
+        services[serviceName] = []
+        healthWaiters[projectName] = services
+        for cont in list { cont.resume() }
+        list.removeAll()
+    }
+
+    // Await a service becoming healthy; returns immediately if no healthcheck is defined
+    public func awaitServiceHealthy(project: Project, serviceName: String, deadlineSeconds: Int) async throws {
+        guard let svc = project.services[serviceName] else { return }
+        // No healthcheck -> no gating, warn
+        if svc.healthCheck == nil {
+            log.warning("depends_on: service_healthy used for service '\(serviceName)' without healthcheck; not gating")
+            return
         }
+        if let state = projectState[project.name], let container = state.containers[serviceName] {
+            if container.status == .healthy { return }
+        }
+        try await withTimeoutGlobal(seconds: deadlineSeconds) {
+            try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+                Task { await self.addHealthWaiter(projectName: project.name, serviceName: serviceName, cont: cont) }
+            }
+        }
+    }
+
+    // Await a service to reach running state
+    public func awaitServiceStarted(project: Project, serviceName: String, deadlineSeconds: Int) async throws {
+        // Quick path via local state
+        if let state = projectState[project.name]?.containers[serviceName] {
+            switch state.status {
+            case .running, .healthy, .starting: return
+            default: break
+            }
+        }
+        var remainingTicks = max(1, deadlineSeconds * 10) // 100ms ticks
+        while remainingTicks > 0 {
+            if let st = projectState[project.name]?.containers[serviceName] {
+                switch st.status { case .running, .healthy, .starting: return; default: break }
+            }
+            if let container = try? await ClientContainer.get(id: project.name + "_" + serviceName), container.status == .running {
+                return
+            }
+            try await Task.sleep(nanoseconds: 100_000_000)
+            remainingTicks -= 1
+        }
+        throw ContainerizationError(.timeout, message: "Service '\(serviceName)' did not start within \(deadlineSeconds)s")
+    }
+
+    // Await a service to complete (no exit code check available here)
+    public func awaitServiceCompleted(project: Project, serviceName: String, deadlineSeconds: Int) async throws {
+        var remainingTicks = max(1, deadlineSeconds * 5) // 200ms ticks
+        while remainingTicks > 0 {
+            if let st = projectState[project.name]?.containers[serviceName] {
+                if st.status == .stopped || st.status == .removed { return }
+            }
+            if let container = try? await ClientContainer.get(id: project.name + "_" + serviceName), container.status != .running {
+                return
+            }
+            try await Task.sleep(nanoseconds: 200_000_000)
+            remainingTicks -= 1
+        }
+        throw ContainerizationError(.timeout, message: "Service '\(serviceName)' did not complete within \(deadlineSeconds)s")
+    }
+
+    // Test hooks (internal) to drive waiter logic without a runtime
+    func testSetServiceHealthy(project: Project, serviceName: String) {
+        if projectState[project.name] == nil { projectState[project.name] = ProjectState() }
+        if projectState[project.name]!.containers[serviceName] == nil {
+            projectState[project.name]!.containers[serviceName] = ContainerState(serviceName: serviceName, containerID: "test-\(serviceName)", containerName: "\(project.name)_\(serviceName)", status: .starting)
+        }
+        projectState[project.name]!.containers[serviceName]!.status = .healthy
+        notifyHealthy(projectName: project.name, serviceName: serviceName)
+    }
+    
+    private func addHealthWaiter(projectName: String, serviceName: String, cont: CheckedContinuation<Void, Error>) {
+        var svcMap = healthWaiters[projectName] ?? [:]
+        var list = svcMap[serviceName] ?? []
+        list.append(cont)
+        svcMap[serviceName] = list
+        healthWaiters[projectName] = svcMap
+    }
+
+    private func computeHealthDeadline(healthCheck: HealthCheck?) -> Int {
+        guard let hc = healthCheck else { return 10 } // minimal wait if no healthcheck
+        let start = Int(hc.startPeriod ?? 0)
+        let interval = max(1, Int(hc.interval ?? 30))
+        let attempts = max(1, (hc.retries ?? 0) + 1)
+        // Budget: startPeriod + attempts * (max(timeout, interval))
+        let timeout = max(1, Int(hc.timeout ?? 30))
+        return start + attempts * max(timeout, interval)
     }
     
     /// Check health of services in a project.
@@ -1131,9 +1335,10 @@ public actor Orchestrator {
             }
             
             // Execute health check
-            let isHealthy = await executeHealthCheck(
+            let isHealthy = await healthRunner.execute(
                 container: container,
-                healthCheck: healthCheck
+                healthCheck: healthCheck,
+                log: log
             )
             
             healthStatus[serviceName] = isHealthy
@@ -1201,5 +1406,22 @@ public struct LogEntry: Sendable {
     public enum LogStream: Sendable {
         case stdout
         case stderr
+    }
+}
+
+// MARK: - Timeout helper
+
+func withTimeoutGlobal<T: Sendable>(seconds: Int, operation: @escaping @Sendable () async throws -> T) async throws -> T {
+    try await withThrowingTaskGroup(of: T.self) { group in
+        group.addTask {
+            try await operation()
+        }
+        group.addTask {
+            try await Task.sleep(nanoseconds: UInt64(seconds) * 1_000_000_000)
+            throw ContainerizationError(.timeout, message: "Operation timed out after \(seconds) seconds")
+        }
+        let result = try await group.next()!
+        group.cancelAll()
+        return result
     }
 }

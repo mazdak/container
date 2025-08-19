@@ -53,6 +53,7 @@ struct ComposeUp: AsyncParsableCommand {
     
     func run() async throws {
         // Set environment variables
+        composeOptions.loadDotEnvIfPresent()
         composeOptions.setEnvironmentVariables()
         
         // Parse compose files
@@ -88,13 +89,43 @@ struct ComposeUp: AsyncParsableCommand {
             detach: detach,
             forceRecreate: forceRecreate,
             noRecreate: noRecreate,
+            noDeps: noDeps,
+            removeOrphans: removeOrphans,
             progressHandler: progress.handler
         )
         
         progress.finish()
         
+        // Call out DNS names for service discovery inside the container network
+        if !project.services.isEmpty {
+            print("Service DNS names:")
+            for (name, svc) in project.services.sorted(by: { $0.key < $1.key }) {
+                let cname = svc.containerName ?? "\(project.name)_\(name)"
+                print("- \(name): \(cname)")
+            }
+        }
+        
         if detach {
             print("Started project '\(project.name)' in detached mode")
+        } else {
+            // Stream logs for selected services (or all if none selected), similar to docker-compose up
+            let orchestrator = Orchestrator(log: log)
+            let logStream = try await orchestrator.logs(
+                project: project,
+                services: services,
+                follow: true,
+                tail: nil,
+                timestamps: false
+            )
+            for try await entry in logStream {
+                let output = "[\(entry.serviceName)] \(entry.message)"
+                switch entry.stream {
+                case .stdout:
+                    print(output)
+                case .stderr:
+                    FileHandle.standardError.write(Data((output + "\n").utf8))
+                }
+            }
         }
     }
 }

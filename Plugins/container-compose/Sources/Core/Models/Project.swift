@@ -46,6 +46,9 @@ public struct Service: Sendable {
     public let volumes: [VolumeMount]
     public let networks: [String]
     public let dependsOn: [String]
+    public let dependsOnHealthy: [String]
+    public let dependsOnStarted: [String]
+    public let dependsOnCompletedSuccessfully: [String]
     public let healthCheck: HealthCheck?
     public let deploy: Deploy?
     public let restart: String?
@@ -67,6 +70,9 @@ public struct Service: Sendable {
                 volumes: [VolumeMount] = [],
                 networks: [String] = [],
                 dependsOn: [String] = [],
+                dependsOnHealthy: [String] = [],
+                dependsOnStarted: [String] = [],
+                dependsOnCompletedSuccessfully: [String] = [],
                 healthCheck: HealthCheck? = nil,
                 deploy: Deploy? = nil,
                 restart: String? = nil,
@@ -85,6 +91,9 @@ public struct Service: Sendable {
         self.volumes = volumes
         self.networks = networks
         self.dependsOn = dependsOn
+        self.dependsOnHealthy = dependsOnHealthy
+        self.dependsOnStarted = dependsOnStarted
+        self.dependsOnCompletedSuccessfully = dependsOnCompletedSuccessfully
         self.healthCheck = healthCheck
         self.deploy = deploy
         self.restart = restart
@@ -143,6 +152,10 @@ public struct PortMapping: Sendable {
             self.portProtocol = parsedProtocol
             
         default:
+            return nil
+        }
+        // Validate numeric ports
+        guard let host = Int(self.hostPort), let container = Int(self.containerPort), host > 0, container > 0, host <= 65535, container <= 65535 else {
             return nil
         }
     }

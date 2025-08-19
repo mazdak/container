@@ -17,6 +17,7 @@
 import Foundation
 import Testing
 import Logging
+import ContainerizationError
 
 @testable import ComposeCore
 
@@ -209,5 +210,67 @@ struct ProjectConverterTests {
         #expect(port2.hostIP == nil)
         #expect(port2.hostPort == "8443")
         #expect(port2.containerPort == "443")
+    }
+
+    @Test
+    func testInvalidPortMappingFailsConversion() throws {
+        let yaml = """
+        version: '3'
+        services:
+          web:
+            image: nginx
+            ports:
+              - "abc:80"
+        """
+
+        let parser = ComposeParser(log: log)
+        let data = yaml.data(using: .utf8)!
+        let composeFile = try parser.parse(from: data)
+
+        let converter = ProjectConverter(log: log)
+        #expect {
+            _ = try converter.convert(
+                composeFile: composeFile,
+                projectName: "myapp"
+            )
+        } throws: { error in
+            // Expect an invalidArgument error for bad port mapping
+            if let err = error as? ContainerizationError { return err.code == .invalidArgument }
+            return false
+        }
+    }
+
+
+    @Test
+    func testDependsOnConditionsConversion() throws {
+        let yaml = """
+        version: '3.9'
+        services:
+          db:
+            image: postgres
+          web:
+            image: nginx
+            depends_on:
+              db:
+                condition: service_started
+          worker:
+            image: busybox
+            depends_on:
+              db:
+                condition: service_completed_successfully
+          api:
+            image: api
+            depends_on:
+              db:
+                condition: service_healthy
+        """
+        let parser = ComposeParser(log: log)
+        let data = yaml.data(using: .utf8)!
+        let composeFile = try parser.parse(from: data)
+        let converter = ProjectConverter(log: log)
+        let project = try converter.convert(composeFile: composeFile, projectName: "myapp")
+        #expect(project.services["web"]?.dependsOnStarted.contains("db") == true)
+        #expect(project.services["worker"]?.dependsOnCompletedSuccessfully.contains("db") == true)
+        #expect(project.services["api"]?.dependsOnHealthy.contains("db") == true)
     }
 }

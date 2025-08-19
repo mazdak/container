@@ -61,6 +61,7 @@ let package = Package(
             name: "ComposeTests",
             dependencies: [
                 "ComposeCore",
+                "ComposePlugin",
                 .product(name: "Containerization", package: "containerization"),
                 .product(name: "Logging", package: "swift-log"),
             ],

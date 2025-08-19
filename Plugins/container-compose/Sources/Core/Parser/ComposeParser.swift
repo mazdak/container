@@ -321,7 +321,7 @@ public struct ComposeParser {
             let varExpression = String(yaml[varRange])
             let (varName, defaultValue) = parseVarExpression(varExpression)
             
-            let value = ProcessInfo.processInfo.environment[varName] ?? defaultValue ?? ""
+            let value = getenv(varName).flatMap { String(cString: $0) } ?? defaultValue ?? ""
             result.replaceSubrange(range, with: value)
         }
         
@@ -337,8 +337,8 @@ public struct ComposeParser {
             }
             
             let varName = String(result[varRange])
-            if let value = ProcessInfo.processInfo.environment[varName] {
-                result.replaceSubrange(range, with: value)
+            if let cstr = getenv(varName) {
+                result.replaceSubrange(range, with: String(cString: cstr))
             }
         }
         
