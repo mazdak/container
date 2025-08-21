@@ -17,16 +17,46 @@
 import Foundation
 import ContainerizationError
 
-/// Resolves service dependencies using topological sorting.
+/// Resolves service dependencies using topological sorting
 ///
-/// The DependencyResolver analyzes service dependencies and determines:
-/// - The order in which services should be started
-/// - The order in which services should be stopped (reverse of start order)
-/// - Which services can be started in parallel
-/// - Detection of circular dependencies
+/// The DependencyResolver analyzes service dependencies and determines the optimal
+/// order for starting and stopping services. It uses Kahn's algorithm to perform
+/// topological sorting, ensuring that:
 ///
-/// This ensures that dependent services are always started after their
-/// dependencies and stopped before them.
+/// - Services are started only after their dependencies are ready
+/// - Services are stopped before their dependencies are stopped
+/// - Independent services can be started in parallel
+/// - Circular dependencies are detected and reported as errors
+///
+/// ## Algorithm
+///
+/// The resolver builds a directed graph where services are nodes and dependencies
+/// are edges. It then performs topological sorting to determine the execution order.
+///
+/// ## Parallel Execution
+///
+/// Services with no dependencies on each other can be started simultaneously,
+/// improving overall startup time for complex applications.
+///
+/// ## Error Handling
+///
+/// - Circular dependencies are detected and result in a `ContainerizationError`
+/// - Missing service dependencies are validated and reported
+/// - All errors include detailed information about the problematic services
+///
+/// ## Example
+///
+/// ```swift
+/// let services = [
+///     "db": Service(name: "db", dependsOn: []),
+///     "api": Service(name: "api", dependsOn: ["db"]),
+///     "web": Service(name: "web", dependsOn: ["api"])
+/// ]
+///
+/// let result = try DependencyResolver.resolve(services: services)
+/// print("Start order:", result.startOrder) // ["db", "api", "web"]
+/// print("Parallel groups:", result.parallelGroups) // [["db"], ["api"], ["web"]]
+/// ```
 public struct DependencyResolver {
     
     /// Result of dependency resolution

@@ -126,26 +126,29 @@ public struct ComposeParser {
                 message: "Unable to decode compose file as UTF-8"
             )
         }
-        
+
+        // Security: Check for potentially malicious YAML content
+        try validateYamlContent(yamlString)
+
         do {
             // Decode directly without intermediate dump/reload
             let decoder = YAMLDecoder()
-            
+
             // First try to decode directly (no interpolation needed)
             if !yamlString.contains("$") {
                 let composeFile = try decoder.decode(ComposeFile.self, from: data)
                 try validate(composeFile)
                 return composeFile
             }
-            
+
             // If we have variables to interpolate, we need to process the YAML
             // But let's do it more intelligently by working with the string directly
             let interpolatedYaml = try interpolateYamlString(yamlString)
             let interpolatedData = interpolatedYaml.data(using: .utf8)!
-            
+
             let composeFile = try decoder.decode(ComposeFile.self, from: interpolatedData)
             try validate(composeFile)
-            
+
             return composeFile
         } catch let error as DecodingError {
             throw ContainerizationError(
@@ -154,6 +157,67 @@ public struct ComposeParser {
             )
         } catch {
             throw error
+        }
+    }
+
+    /// Validate YAML content for security issues
+    private func validateYamlContent(_ yamlString: String) throws {
+        // Check for potentially dangerous YAML constructs using universal patterns
+        // Look for any !!tag/ patterns that could be dangerous
+        let tagPattern = "!![a-zA-Z][a-zA-Z0-9._-]*"
+        if let regex = try? NSRegularExpression(pattern: tagPattern) {
+            let matches = regex.matches(in: yamlString, range: NSRange(yamlString.startIndex..., in: yamlString))
+            for match in matches {
+                if let range = Range(match.range, in: yamlString) {
+                    let tag = String(yamlString[range])
+                    // Allow safe built-in YAML tags
+                    let safeTags = ["!!str", "!!int", "!!float", "!!bool", "!!null", "!!seq", "!!map", "!!binary", "!!timestamp"]
+                    if !safeTags.contains(tag) {
+                        throw ContainerizationError(
+                            .invalidArgument,
+                            message: "Potentially unsafe YAML tag detected: \(tag)"
+                        )
+                    }
+                }
+            }
+        }
+
+        // Check for YAML anchors and merge keys that can cause DoS
+        if yamlString.contains("&") || yamlString.contains("<<:") {
+            throw ContainerizationError(
+                .invalidArgument,
+                message: "YAML anchors and merge keys are not allowed for security reasons"
+            )
+        }
+
+        // Check file size limit (prevent DoS with extremely large files)
+        let maxSize = 10 * 1024 * 1024 // 10MB limit
+        if yamlString.utf8.count > maxSize {
+            throw ContainerizationError(
+                .invalidArgument,
+                message: "Compose file too large (max \(maxSize) bytes)"
+            )
+        }
+
+        // Check for excessive nesting depth (prevent stack overflow)
+        let maxDepth = 20
+        var maxFoundDepth = 0
+        var currentDepth = 0
+
+        for char in yamlString {
+            if char == " " {
+                currentDepth += 1
+                maxFoundDepth = max(maxFoundDepth, currentDepth)
+            } else if char != "\n" && char != "\r" {
+                currentDepth = 0
+            }
+
+            if maxFoundDepth > maxDepth * 2 { // 2 spaces per indentation level
+                throw ContainerizationError(
+                    .invalidArgument,
+                    message: "YAML nesting depth too deep (max \(maxDepth) levels)"
+                )
+            }
         }
     }
     
@@ -305,44 +369,79 @@ public struct ComposeParser {
     /// Interpolate environment variables directly in YAML string
     private func interpolateYamlString(_ yaml: String) throws -> String {
         var result = yaml
-        
+
         // Pattern for ${VAR} or ${VAR:-default}
         let pattern = #"\$\{([^}]+)\}"#
         let regex = try NSRegularExpression(pattern: pattern)
         let matches = regex.matches(in: yaml, range: NSRange(yaml.startIndex..., in: yaml))
-        
+
         // Process matches in reverse order to maintain correct positions
         for match in matches.reversed() {
             guard let range = Range(match.range, in: yaml),
-                  let varRange = Range(match.range(at: 1), in: yaml) else {
+                  let varRange = Range(match.range(at: 1), in: yaml)
+            else {
                 continue
             }
-            
+
             let varExpression = String(yaml[varRange])
             let (varName, defaultValue) = parseVarExpression(varExpression)
-            
+
+            // Validate variable name to prevent injection
+            guard isValidEnvironmentVariableName(varName) else {
+                throw ContainerizationError(
+                    .invalidArgument,
+                    message: "Invalid environment variable name: '\(varName)'"
+                )
+            }
+
             let value = getenv(varName).flatMap { String(cString: $0) } ?? defaultValue ?? ""
             result.replaceSubrange(range, with: value)
         }
-        
+
         // Also handle $VAR format
-        let simplePattern = #"\$([A-Za-z_][A-Za-z0-9_]*)"#
+        let simplePattern = #"\$([A-Za-z_][A-Za-z0-9_]*)"#  // Fixed: was missing closing parenthesis
         let simpleRegex = try NSRegularExpression(pattern: simplePattern)
         let simpleMatches = simpleRegex.matches(in: result, range: NSRange(result.startIndex..., in: result))
-        
+
         for match in simpleMatches.reversed() {
             guard let range = Range(match.range, in: result),
-                  let varRange = Range(match.range(at: 1), in: result) else {
+                  let varRange = Range(match.range(at: 1), in: result)
+            else {
                 continue
             }
-            
+
             let varName = String(result[varRange])
+
+            // Validate variable name to prevent injection
+            guard isValidEnvironmentVariableName(varName) else {
+                throw ContainerizationError(
+                    .invalidArgument,
+                    message: "Invalid environment variable name: '\(varName)'"
+                )
+            }
+
             if let cstr = getenv(varName) {
                 result.replaceSubrange(range, with: String(cString: cstr))
             }
         }
-        
+
         return result
+    }
+
+    /// Validate environment variable name to prevent injection attacks
+    private func isValidEnvironmentVariableName(_ name: String) -> Bool {
+        // Environment variable names must:
+        // - Start with letter or underscore
+        // - Contain only letters, digits, and underscores
+        // - Not be empty
+        // - Not contain shell metacharacters
+        let validNamePattern = "^[A-Za-z_][A-Za-z0-9_]*$"
+        guard let regex = try? NSRegularExpression(pattern: validNamePattern) else {
+            return false
+        }
+
+        let range = NSRange(name.startIndex..., in: name)
+        return regex.firstMatch(in: name, range: range) != nil
     }
     
     

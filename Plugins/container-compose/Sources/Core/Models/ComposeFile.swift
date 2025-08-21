@@ -19,6 +19,24 @@ import Yams
 
 // MARK: - Top Level Compose File
 
+/// Represents a Docker Compose file structure
+///
+/// This struct models the complete docker-compose.yml file format, including
+/// services, networks, volumes, and version information. It supports the
+/// standard Docker Compose specification with extensions for Apple Container.
+///
+/// Example:
+/// ```yaml
+/// version: '3.8'
+/// services:
+///   web:
+///     image: nginx:latest
+///     ports:
+///       - "8080:80"
+/// networks:
+///   default:
+///     driver: bridge
+/// ```
 public struct ComposeFile: Codable {
     public let version: String?
     public let services: [String: ComposeService]
@@ -77,7 +95,7 @@ public struct ComposeService: Codable {
 
 // MARK: - Build Configuration
 
-public struct BuildConfig: Codable {
+public struct BuildConfig: Codable, Sendable {
     public let context: String?
     public let dockerfile: String?
     public let args: [String: String]?

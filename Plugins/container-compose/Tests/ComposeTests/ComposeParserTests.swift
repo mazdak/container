@@ -333,12 +333,126 @@ struct ComposeParserTests {
     func testParseNonExistentFile() throws {
         let parser = ComposeParser(log: log)
         let nonExistentFile = URL(fileURLWithPath: "/tmp/non-existent-compose.yml")
-        
+
         #expect {
             _ = try parser.parse(from: [nonExistentFile])
         } throws: { error in
             guard let containerError = error as? ContainerizationError else { return false }
             return containerError.code == .notFound
+        }
+    }
+
+    @Test
+    func testSecurityValidations() throws {
+        let parser = ComposeParser(log: log)
+
+        // Test dangerous YAML content detection
+        let dangerousYaml = """
+        version: '3'
+        services:
+          test:
+            image: nginx
+            command: !!python/object/apply:subprocess.call
+              - ["echo", "dangerous"]
+        """
+
+        #expect {
+            _ = try parser.parse(from: dangerousYaml.data(using: .utf8)!)
+        } throws: { error in
+            guard let containerError = error as? ContainerizationError else { return false }
+            return containerError.message.contains("unsafe YAML tag")
+        }
+
+        // Test invalid environment variable name
+        let injectionYaml = """
+        version: '3'
+        services:
+          test:
+            image: nginx
+            environment:
+              - "INJECTED_VAR=${$(echo hacked)}"
+        """
+
+        #expect {
+            _ = try parser.parse(from: injectionYaml.data(using: .utf8)!)
+        } throws: { error in
+            guard let containerError = error as? ContainerizationError else { return false }
+            return containerError.message.contains("Invalid environment variable name")
+        }
+    }
+
+    @Test
+    func testFileSizeLimit() throws {
+        let parser = ComposeParser(log: log)
+
+        // Create a YAML string larger than 10MB
+        let largeContent = String(repeating: "version: '3'\nservices:\n  test:\n    image: nginx\n", count: 200000)
+        let largeData = largeContent.data(using: .utf8)!
+
+        #expect {
+            _ = try parser.parse(from: largeData)
+        } throws: { error in
+            guard let containerError = error as? ContainerizationError else { return false }
+            return containerError.message.contains("too large")
+        }
+    }
+
+    @Test
+    func testEnvironmentVariableValidation() throws {
+        let parser = ComposeParser(log: log)
+
+        // Test valid environment variable names
+        let validYaml = """
+        version: '3'
+        services:
+          test:
+            image: nginx
+            environment:
+              - "VALID_VAR=value"
+              - "ANOTHER_VALID_123=value"
+              - "_UNDERSCORE=value"
+        """
+
+        #expect {
+            _ = try parser.parse(from: validYaml.data(using: .utf8)!)
+        } throws: { _ in false } // Should not throw
+
+        // Test invalid environment variable names
+        let invalidYaml = """
+        version: '3'
+        services:
+          test:
+            image: nginx
+            environment:
+              - "123INVALID=value"
+              - "INVALID-CHAR=value"
+              - "INVALID.SPACE=value"
+        """
+
+        #expect {
+            _ = try parser.parse(from: invalidYaml.data(using: .utf8)!)
+        } throws: { error in
+            guard let containerError = error as? ContainerizationError else { return false }
+            return containerError.message.contains("Invalid environment variable name")
+        }
+    }
+
+    @Test
+    func testYamlNestingDepthLimit() throws {
+        let parser = ComposeParser(log: log)
+
+        // Create deeply nested YAML
+        var nestedYaml = "version: '3'\nservices:\n  test:\n    image: nginx\n"
+        for i in 0..<25 {
+            nestedYaml += String(repeating: "  ", count: i) + "nested:\n"
+        }
+        nestedYaml += String(repeating: "  ", count: 25) + "value: test\n"
+
+        #expect {
+            _ = try parser.parse(from: nestedYaml.data(using: .utf8)!)
+        } throws: { error in
+            guard let containerError = error as? ContainerizationError else { return false }
+            return containerError.message.contains("nesting depth too deep")
         }
     }
 }

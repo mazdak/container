@@ -35,9 +35,31 @@ public struct Project: Sendable {
 }
 
 /// Represents a service in the project
+///
+/// A service defines how a container should be created and run, including
+/// its image, configuration, dependencies, and runtime settings.
+///
+/// Services can either use a pre-built image or build an image from a
+/// Dockerfile. They can also define health checks, resource constraints,
+/// and dependencies on other services.
+///
+/// Example:
+/// ```swift
+/// let webService = Service(
+///     name: "web",
+///     image: "nginx:latest",
+///     ports: [PortMapping(hostPort: "8080", containerPort: "80")],
+///     dependsOn: ["database"],
+///     healthCheck: HealthCheck(
+///         test: ["curl", "-f", "http://localhost/health"],
+///         interval: 30.0
+///     )
+/// )
+/// ```
 public struct Service: Sendable {
     public let name: String
     public let image: String?
+    public let build: BuildConfig?
     public let command: [String]?
     public let entrypoint: [String]?
     public let workingDir: String?
@@ -55,34 +77,36 @@ public struct Service: Sendable {
     public let containerName: String?
     public let profiles: [String]
     public let labels: [String: String]
-    
+
     // Resource constraints
     public let cpus: String?
     public let memory: String?
     
     public init(name: String,
-                image: String? = nil,
-                command: [String]? = nil,
-                entrypoint: [String]? = nil,
-                workingDir: String? = nil,
-                environment: [String: String] = [:],
-                ports: [PortMapping] = [],
-                volumes: [VolumeMount] = [],
-                networks: [String] = [],
-                dependsOn: [String] = [],
-                dependsOnHealthy: [String] = [],
-                dependsOnStarted: [String] = [],
-                dependsOnCompletedSuccessfully: [String] = [],
-                healthCheck: HealthCheck? = nil,
-                deploy: Deploy? = nil,
-                restart: String? = nil,
-                containerName: String? = nil,
-                profiles: [String] = [],
-                labels: [String: String] = [:],
-                cpus: String? = nil,
-                memory: String? = nil) {
+                 image: String? = nil,
+                 build: BuildConfig? = nil,
+                 command: [String]? = nil,
+                 entrypoint: [String]? = nil,
+                 workingDir: String? = nil,
+                 environment: [String: String] = [:],
+                 ports: [PortMapping] = [],
+                 volumes: [VolumeMount] = [],
+                 networks: [String] = [],
+                 dependsOn: [String] = [],
+                 dependsOnHealthy: [String] = [],
+                 dependsOnStarted: [String] = [],
+                 dependsOnCompletedSuccessfully: [String] = [],
+                 healthCheck: HealthCheck? = nil,
+                 deploy: Deploy? = nil,
+                 restart: String? = nil,
+                 containerName: String? = nil,
+                 profiles: [String] = [],
+                 labels: [String: String] = [:],
+                 cpus: String? = nil,
+                 memory: String? = nil) {
         self.name = name
         self.image = image
+        self.build = build
         self.command = command
         self.entrypoint = entrypoint
         self.workingDir = workingDir
@@ -102,6 +126,27 @@ public struct Service: Sendable {
         self.labels = labels
         self.cpus = cpus
         self.memory = memory
+    }
+
+    /// Returns true if this service needs to be built
+    public var needsBuild: Bool {
+        return build != nil && image == nil
+    }
+
+    /// Returns the effective image name for this service
+    /// If an image is specified, uses that. Otherwise generates one based on build context.
+    public func effectiveImageName(projectName: String) -> String {
+        if let image = image {
+            return image
+        } else if let build = build {
+            // Generate a deterministic image name based on build context
+            let context = build.context ?? "."
+            let dockerfile = build.dockerfile ?? "Dockerfile"
+            let contextHash = String(context.hashValue) + String(dockerfile.hashValue)
+            return "\(projectName)_\(name):\(abs(Int(contextHash) ?? 0))"
+        } else {
+            return "unknown"
+        }
     }
 }
 

@@ -155,18 +155,77 @@ struct DependencyResolverTests {
             "web": Service(name: "web", image: "nginx", dependsOn: ["api"]),
             "worker": Service(name: "worker", image: "worker", dependsOn: ["cache"])
         ]
-        
+
         // Select web and worker
         let filtered = DependencyResolver.filterWithDependencies(
             services: services,
             selected: ["web", "worker"]
         )
-        
+
         #expect(filtered.count == 5) // All services needed
         #expect(filtered.keys.contains("web"))
         #expect(filtered.keys.contains("worker"))
         #expect(filtered.keys.contains("api"))
         #expect(filtered.keys.contains("db"))
         #expect(filtered.keys.contains("cache"))
+    }
+
+    @Test
+    func testFilterEmptySelection() {
+        let services: [String: Service] = [
+            "db": Service(name: "db", image: "postgres"),
+            "web": Service(name: "web", image: "nginx", dependsOn: ["db"])
+        ]
+
+        // Empty selection should return all services
+        let filtered = DependencyResolver.filterWithDependencies(
+            services: services,
+            selected: []
+        )
+
+        #expect(filtered.count == 2)
+        #expect(filtered.keys.contains("db"))
+        #expect(filtered.keys.contains("web"))
+    }
+
+    @Test
+    func testFilterNonExistentService() {
+        let services: [String: Service] = [
+            "db": Service(name: "db", image: "postgres"),
+            "web": Service(name: "web", image: "nginx", dependsOn: ["db"])
+        ]
+
+        // Selecting non-existent service should return empty
+        let filtered = DependencyResolver.filterWithDependencies(
+            services: services,
+            selected: ["nonexistent"]
+        )
+
+        #expect(filtered.isEmpty)
+    }
+
+    @Test
+    func testResolveEmptyServices() throws {
+        let services: [String: Service] = [:]
+
+        let resolution = try DependencyResolver.resolve(services: services)
+
+        #expect(resolution.startOrder.isEmpty)
+        #expect(resolution.stopOrder.isEmpty)
+        #expect(resolution.parallelGroups.isEmpty)
+    }
+
+    @Test
+    func testResolveSingleService() throws {
+        let services: [String: Service] = [
+            "web": Service(name: "web", image: "nginx")
+        ]
+
+        let resolution = try DependencyResolver.resolve(services: services)
+
+        #expect(resolution.startOrder == ["web"])
+        #expect(resolution.stopOrder == ["web"])
+        #expect(resolution.parallelGroups.count == 1)
+        #expect(resolution.parallelGroups[0] == ["web"])
     }
 }

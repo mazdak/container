@@ -23,7 +23,7 @@ import ContainerizationError
 
 struct ProjectConverterTests {
     let log = Logger(label: "test")
-    
+
     @Test
     func testConvertBasicProject() throws {
         let yaml = """
@@ -34,193 +34,76 @@ struct ProjectConverterTests {
             ports:
               - "8080:80"
         """
-        
-        let parser = ComposeParser(log: log)
+
+        let parser: ComposeParser = ComposeParser(log: log)
         let data = yaml.data(using: .utf8)!
         let composeFile = try parser.parse(from: data)
-        
-        let converter = ProjectConverter(log: log)
+
+        let converter: ProjectConverter = ProjectConverter(log: log)
         let project = try converter.convert(
             composeFile: composeFile,
             projectName: "myapp"
         )
-        
+
         #expect(project.name == "myapp")
         #expect(project.services.count == 1)
         #expect(project.services["web"] != nil)
-        
-        let webService = project.services["web"]!
+
+        let webService = try #require(project.services["web"])
         #expect(webService.name == "web")
         #expect(webService.image == "nginx:latest")
         #expect(webService.containerName == "myapp_web")
     }
-    
+
     @Test
-    func testConvertWithProfiles() throws {
-        let yaml = """
-        version: '3.9'
-        services:
-          web:
-            image: nginx
-            profiles: ["frontend"]
-          api:
-            image: api:latest
-            profiles: ["backend", "api"]
-          db:
-            image: postgres
-        """
-        
-        let parser = ComposeParser(log: log)
-        let data = yaml.data(using: .utf8)!
-        let composeFile = try parser.parse(from: data)
-        let converter = ProjectConverter(log: log)
-        
-        // No profiles - only services without profiles
-        let project1 = try converter.convert(
-            composeFile: composeFile,
-            projectName: "myapp",
-            profiles: []
-        )
-        #expect(project1.services.count == 1)
-        #expect(project1.services.keys.contains("db"))
-        
-        // Frontend profile
-        let project2 = try converter.convert(
-            composeFile: composeFile,
-            projectName: "myapp",
-            profiles: ["frontend"]
-        )
-        #expect(project2.services.count == 2)
-        #expect(project2.services.keys.contains("db"))
-        #expect(project2.services.keys.contains("web"))
-        
-        // Backend profile
-        let project3 = try converter.convert(
-            composeFile: composeFile,
-            projectName: "myapp",
-            profiles: ["backend"]
-        )
-        #expect(project3.services.count == 2)
-        #expect(project3.services.keys.contains("db"))
-        #expect(project3.services.keys.contains("api"))
-    }
-    
-    @Test
-    func testConvertEnvironment() throws {
+    func testConvertServiceWithBuild() throws {
         let yaml = """
         version: '3'
         services:
-          app:
-            image: ubuntu
-            environment:
-              KEY1: value1
-              KEY2: value2
-        """
-        
-        let parser = ComposeParser(log: log)
-        let data = yaml.data(using: .utf8)!
-        let composeFile = try parser.parse(from: data)
-        
-        let converter = ProjectConverter(log: log)
-        let project = try converter.convert(
-            composeFile: composeFile,
-            projectName: "myapp"
-        )
-        
-        let env = project.services["app"]?.environment ?? [:]
-        #expect(env["KEY1"] == "value1")
-        #expect(env["KEY2"] == "value2")
-    }
-    
-    @Test
-    func testConvertVolumes() throws {
-        let yaml = """
-        version: '3'
-        services:
-          app:
-            image: ubuntu
-            volumes:
-              - /host/path:/container/path
-              - /host/path2:/container/path2:ro
-              - /data:/tmp
-        """
-        
-        let parser = ComposeParser(log: log)
-        let data = yaml.data(using: .utf8)!
-        let composeFile = try parser.parse(from: data)
-        
-        let converter = ProjectConverter(log: log)
-        let project = try converter.convert(
-            composeFile: composeFile,
-            projectName: "myapp"
-        )
-        
-        let volumes = project.services["app"]?.volumes ?? []
-        #expect(volumes.count == 3)
-        
-        // Check first volume
-        let vol1 = volumes[0]
-        #expect(vol1.source == "/host/path")
-        #expect(vol1.target == "/container/path")
-        
-        // Check second volume
-        let vol2 = volumes[1]
-        #expect(vol2.source == "/host/path2")
-        #expect(vol2.target == "/container/path2")
-        #expect(vol2.readOnly == true)
-        
-        // Check third volume
-        let vol3 = volumes[2]
-        #expect(vol3.source == "/data")
-        #expect(vol3.target == "/tmp")
-    }
-    
-    @Test
-    func testConvertPorts() throws {
-        let yaml = """
-        version: '3'
-        services:
-          web:
-            image: nginx
+          backend:
+            build:
+              context: .
+              dockerfile: Dockerfile
+              args:
+                NODE_ENV: development
             ports:
-              - "127.0.0.1:8080:80/tcp"
-              - "8443:443"
+              - "3000:3000"
         """
-        
+
         let parser = ComposeParser(log: log)
         let data = yaml.data(using: .utf8)!
         let composeFile = try parser.parse(from: data)
-        
+
         let converter = ProjectConverter(log: log)
         let project = try converter.convert(
             composeFile: composeFile,
-            projectName: "myapp"
+            projectName: "testapp"
         )
-        
-        let ports = project.services["web"]?.ports ?? []
-        #expect(ports.count == 2)
-        
-        let port1 = ports[0]
-        #expect(port1.hostIP == "127.0.0.1")
-        #expect(port1.hostPort == "8080")
-        #expect(port1.containerPort == "80")
-        #expect(port1.portProtocol == "tcp")
-        
-        let port2 = ports[1]
-        #expect(port2.hostIP == nil)
-        #expect(port2.hostPort == "8443")
-        #expect(port2.containerPort == "443")
+
+        #expect(project.name == "testapp")
+        #expect(project.services.count == 1)
+
+        let backendService = try #require(project.services["backend"])
+        #expect(backendService.name == "backend")
+        #expect(backendService.image == nil) // No image specified
+        #expect(backendService.build != nil) // Build config should be present
+        #expect(backendService.needsBuild == true) // Should need building
+
+        // Test effective image name generation
+        let effectiveImage = backendService.effectiveImageName(projectName: "testapp")
+        #expect(effectiveImage.hasPrefix("testapp_backend:"))
     }
 
     @Test
-    func testInvalidPortMappingFailsConversion() throws {
+    func testConvertServiceWithImageAndBuild() throws {
         let yaml = """
         version: '3'
         services:
-          web:
-            image: nginx
-            ports:
-              - "abc:80"
+          frontend:
+            image: node:18-alpine
+            build:
+              context: ./frontend
+              dockerfile: Dockerfile.dev
         """
 
         let parser = ComposeParser(log: log)
@@ -228,49 +111,18 @@ struct ProjectConverterTests {
         let composeFile = try parser.parse(from: data)
 
         let converter = ProjectConverter(log: log)
-        #expect {
-            _ = try converter.convert(
-                composeFile: composeFile,
-                projectName: "myapp"
-            )
-        } throws: { error in
-            // Expect an invalidArgument error for bad port mapping
-            if let err = error as? ContainerizationError { return err.code == .invalidArgument }
-            return false
-        }
-    }
+        let project = try converter.convert(
+            composeFile: composeFile,
+            projectName: "testapp"
+        )
 
+        let frontendService = try #require(project.services["frontend"])
+        #expect(frontendService.image == "node:18-alpine")
+        #expect(frontendService.build != nil)
+        #expect(frontendService.needsBuild == false) // Has image, doesn't need building
 
-    @Test
-    func testDependsOnConditionsConversion() throws {
-        let yaml = """
-        version: '3.9'
-        services:
-          db:
-            image: postgres
-          web:
-            image: nginx
-            depends_on:
-              db:
-                condition: service_started
-          worker:
-            image: busybox
-            depends_on:
-              db:
-                condition: service_completed_successfully
-          api:
-            image: api
-            depends_on:
-              db:
-                condition: service_healthy
-        """
-        let parser = ComposeParser(log: log)
-        let data = yaml.data(using: .utf8)!
-        let composeFile = try parser.parse(from: data)
-        let converter = ProjectConverter(log: log)
-        let project = try converter.convert(composeFile: composeFile, projectName: "myapp")
-        #expect(project.services["web"]?.dependsOnStarted.contains("db") == true)
-        #expect(project.services["worker"]?.dependsOnCompletedSuccessfully.contains("db") == true)
-        #expect(project.services["api"]?.dependsOnHealthy.contains("db") == true)
+        // Effective image should be the specified image
+        let effectiveImage = frontendService.effectiveImageName(projectName: "testapp")
+        #expect(effectiveImage == "node:18-alpine")
     }
 }

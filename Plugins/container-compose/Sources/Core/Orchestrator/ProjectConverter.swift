@@ -408,6 +408,7 @@ public struct ProjectConverter {
         return Service(
             name: name,
             image: service.image,
+            build: service.build,
             command: service.command?.asArray,
             entrypoint: service.entrypoint?.asArray,
             workingDir: service.workingDir,
@@ -544,21 +545,92 @@ public struct ProjectConverter {
     }
 
     private func loadEnvFile(url: URL) throws -> [String: String] {
+        // Validate file path to prevent directory traversal
+        let standardizedURL = url.standardizedFileURL
+        guard standardizedURL.pathComponents.contains("..") == false else {
+            throw ContainerizationError(
+                .invalidArgument,
+                message: "Invalid env file path: \(url.path) (directory traversal not allowed)"
+            )
+        }
+
+        // Check file permissions and ownership
+        let fileManager = FileManager.default
+        guard let attributes = try? fileManager.attributesOfItem(atPath: url.path) else {
+            throw ContainerizationError(
+                .notFound,
+                message: "Cannot read env file: \(url.path)"
+            )
+        }
+
+        // Check if file is readable only by owner (security best practice)
+        if let posixPermissions = attributes[.posixPermissions] as? UInt16 {
+            let permissions = posixPermissions & 0o777
+            if permissions & 0o044 != 0 { // Group or other can read
+                log.warning("Env file \(url.path) is readable by group/other. Consider restricting permissions to 600")
+            }
+        }
+
         let text = try String(contentsOf: url, encoding: .utf8)
         var out: [String: String] = [:]
+
         for rawLine in text.split(whereSeparator: { $0.isNewline }) {
             var line = String(rawLine).trimmingCharacters(in: .whitespaces)
             if line.isEmpty || line.hasPrefix("#") { continue }
             if line.hasPrefix("export ") { line.removeFirst("export ".count) }
+
             let parts = line.split(separator: "=", maxSplits: 1)
             guard parts.count == 2 else { continue }
+
             let key = String(parts[0]).trimmingCharacters(in: .whitespaces)
             var val = String(parts[1]).trimmingCharacters(in: .whitespaces)
+
+            // Validate environment variable name (alphanumeric + underscore, no leading digit)
+            guard !key.isEmpty && key.range(of: "^[A-Za-z_][A-Za-z0-9_]*$", options: .regularExpression) != nil else {
+                log.warning("Skipping invalid environment variable name: '\(key)'")
+                continue
+            }
+
+            // Remove quotes if present
             if (val.hasPrefix("\"") && val.hasSuffix("\"")) || (val.hasPrefix("'") && val.hasSuffix("'")) {
                 val = String(val.dropFirst().dropLast())
             }
+
+            // Expand any nested variable references (basic support)
+            val = expandVariables(in: val, existingVars: out)
+
             out[key] = val
         }
+
         return out
+    }
+
+    private func expandVariables(in value: String, existingVars: [String: String]) -> String {
+        var result = value
+
+        // Simple variable expansion for ${VAR} and $VAR
+        let patterns = [
+            #"\$\{([^}]+)\}"#,  // ${VAR}
+            #"\$([A-Za-z_][A-Za-z0-9_]*)"#,  // $VAR
+        ]
+
+        for pattern in patterns {
+            guard let regex = try? NSRegularExpression(pattern: pattern) else { continue }
+
+            let matches = regex.matches(in: result, range: NSRange(result.startIndex..., in: result))
+            for match in matches.reversed() {
+                guard let varRange = Range(match.range(at: match.numberOfRanges > 1 ? 1 : 0), in: result) else { continue }
+                let varName = String(result[varRange])
+
+                // Get value from existing variables or environment
+                if let existingValue = existingVars[varName] {
+                    result.replaceSubrange(Range(match.range, in: result)!, with: existingValue)
+                } else if let envValue = getenv(varName).flatMap({ String(cString: $0) }) {
+                    result.replaceSubrange(Range(match.range, in: result)!, with: envValue)
+                }
+            }
+        }
+
+        return result
     }
 }

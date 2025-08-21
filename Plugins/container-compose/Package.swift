@@ -41,6 +41,7 @@ let package = Package(
                 .product(name: "ContainerLog", package: "container"),
                 .product(name: "Containerization", package: "containerization"),
                 .product(name: "ContainerizationOS", package: "containerization"),
+                .product(name: "ContainerBuild", package: "container"),
                 "ComposeCore",
             ],
             path: "Sources/CLI"
