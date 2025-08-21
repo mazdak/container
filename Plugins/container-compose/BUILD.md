@@ -33,7 +33,7 @@ swift build
 swift build -c release
 
 # Run the plugin directly
-.build/debug/container-compose --help
+    .build/debug/compose --help
 ```
 
 ## Testing
@@ -63,11 +63,11 @@ swift test --verbose
 2. Test basic functionality:
    ```bash
    # Validate a compose file
-   .build/debug/container-compose validate -f test-compose.yml
+    .build/debug/compose validate -f test-compose.yml
    
    # Show help
-   .build/debug/container-compose --help
-   .build/debug/container-compose up --help
+    .build/debug/compose --help
+    .build/debug/compose up --help
    ```
 
 ## Installation
@@ -79,7 +79,7 @@ swift test --verbose
 make install
 ```
 
-This installs the plugin to: `/usr/local/libexec/container/plugins/container-compose/`
+This installs the plugin to: `/usr/local/libexec/container/plugins/compose/`
 
 ### Manual installation:
 
@@ -89,9 +89,9 @@ cd Plugins/container-compose
 swift build -c release
 
 # Copy to plugin directory
-sudo mkdir -p /usr/local/libexec/container/plugins/container-compose/bin
-sudo cp .build/release/container-compose /usr/local/libexec/container/plugins/container-compose/bin/
-sudo cp config.json /usr/local/libexec/container/plugins/container-compose/
+sudo mkdir -p /usr/local/libexec/container/plugins/compose/bin
+sudo cp .build/release/compose /usr/local/libexec/container/plugins/compose/bin/
+sudo cp config.json /usr/local/libexec/container/plugins/compose/
 ```
 
 ## Integration Testing
@@ -145,12 +145,12 @@ container compose down -f test-compose.yml
 
 1. **Plugin not found**: Check installation path
    ```bash
-   ls -la /usr/local/libexec/container/plugins/container-compose/
+    ls -la /usr/local/libexec/container/plugins/compose/
    ```
 
 2. **Permission issues**: Ensure proper permissions
    ```bash
-   sudo chmod +x /usr/local/libexec/container/plugins/container-compose/bin/container-compose
+    sudo chmod +x /usr/local/libexec/container/plugins/compose/bin/compose
    ```
 
 3. **Debug output**: Enable debug logging

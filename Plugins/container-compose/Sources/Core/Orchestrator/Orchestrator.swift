@@ -16,6 +16,7 @@
 
 import Foundation
 import ContainerClient
+import ContainerNetworkService
 import Containerization
 import ContainerizationError
 import ContainerizationOS
@@ -1026,7 +1027,14 @@ public actor Orchestrator {
         config.labels = service.labels
         
         // Set networks - default network if none specified
-        config.networks = service.networks.isEmpty ? ["default"] : service.networks
+        let networkNames = service.networks.isEmpty ? ["default"] : service.networks
+
+        config.networks = networkNames.map { networkName in
+            AttachmentConfiguration(
+                network: networkName,
+                options: AttachmentOptions(hostname: containerName)
+            )
+        }
         
         return config
     }

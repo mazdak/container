@@ -78,7 +78,6 @@ let package = Package(
                 "ContainerPlugin",
                 "ContainerVersion",
                 "TerminalProgress",
-                "ContainerCompose",
             ],
             path: "Sources/CLI"
         ),

@@ -31,7 +31,7 @@ struct Flags {
 @main
 struct ComposePlugin: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
-        commandName: "container-compose",
+        commandName: "compose",
         abstract: "Manage multi-container applications",
         subcommands: [
             ComposeUp.self,

@@ -23,7 +23,7 @@ make install
 
 The plugin will be installed to:
 ```
-/usr/local/libexec/container/plugins/container-compose/
+/usr/local/libexec/container/plugins/compose/
 ```
 
 ## Usage

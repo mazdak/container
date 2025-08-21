@@ -21,7 +21,7 @@ let package = Package(
     name: "container-compose",
     platforms: [.macOS("15")],
     products: [
-        .executable(name: "container-compose", targets: ["ComposePlugin"])
+        .executable(name: "compose", targets: ["ComposePlugin"])
     ],
     dependencies: [
         .package(name: "container", path: "../.."), // Main container package
