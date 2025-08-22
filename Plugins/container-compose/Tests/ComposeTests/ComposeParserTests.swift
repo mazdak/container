@@ -455,4 +455,44 @@ struct ComposeParserTests {
             return containerError.message.contains("nesting depth too deep")
         }
     }
+
+    @Test
+    func testAnchorsDisallowedByDefault() throws {
+        let yaml = """
+        version: '3'
+        services:
+          defaults: &defaults
+            image: alpine
+          app:
+            <<: *defaults
+            command: ["echo", "hello"]
+        """
+
+        let parser = ComposeParser(log: log)
+        let data = yaml.data(using: .utf8)!
+        #expect {
+            _ = try parser.parse(from: data)
+        } throws: { error in
+            guard let containerError = error as? ContainerizationError else { return false }
+            return containerError.message.contains("anchors")
+        }
+    }
+
+    @Test
+    func testAnchorsAllowedWithFlag() throws {
+        let yaml = """
+        version: '3'
+        services:
+          defaults: &defaults
+            image: alpine
+          app:
+            <<: *defaults
+            command: ["echo", "hello"]
+        """
+
+        let parser = ComposeParser(log: log, allowAnchors: true)
+        let data = yaml.data(using: .utf8)!
+        let composeFile = try parser.parse(from: data)
+        #expect(composeFile.services["app"]?.image == "alpine")
+    }
 }

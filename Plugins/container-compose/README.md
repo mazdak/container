@@ -73,7 +73,7 @@ services:
 When you run `container compose up`, the plugin will:
 1. Automatically detect services with `build:` configurations
 2. Build Docker images using Apple Container's native build system
-3. Start containers from the built images
+3. Tag images deterministically (SHA‑256 fingerprint) and start containers from those images
 4. Cache builds to avoid unnecessary rebuilds
 
 ### Build Configuration Options
@@ -89,7 +89,57 @@ The plugin implements intelligent build caching based on:
 - Dockerfile path and content
 - Build arguments
 
-Services with unchanged build configurations will reuse cached images.
+Services with unchanged build configurations reuse cached images using a stable SHA‑256 key derived from context, dockerfile path, and build args.
+
+### Image Tagging Semantics
+
+- If a service specifies both `build:` and `image: <name>`, the plugin builds the image and tags it as `<name>` (matching Docker Compose behavior).
+- If a service specifies `build:` without `image:`, the plugin computes a deterministic tag based on the project, service name, build context, Dockerfile path, and build args:
+  - Tag format: `<project>_<service>:<fingerprint>` where `<fingerprint>` is a stable short hash.
+  - This ensures the name used at runtime matches what was built.
+
+## Runtime Labels and Recreate Policy
+
+- Containers created by the plugin have labels:
+  - `com.apple.compose.project`, `com.apple.compose.service`, `com.apple.compose.container`
+  - `com.apple.container.compose.config-hash`: SHA‑256 fingerprint of the effective runtime config (image, cmd/args, workdir, env, ports, mounts, resources, user-provided labels, healthcheck).
+- On `compose up`:
+  - `--no-recreate`: reuses an existing container for the service.
+  - default: compares the expected config hash to the existing container’s label and reuses if equal; otherwise, recreates.
+  - `--force-recreate`: always recreates.
+
+## Commands
+
+- `compose up`:
+  - Builds images as needed, honoring `build:` and `image:`.
+  - Prints service image tags and DNS names.
+  - `--remove-orphans`: removes containers from the same project that are no longer defined (prefers labels; falls back to name prefix).
+- `compose down`:
+  - Stops and removes containers for the project, prints a summary of removed containers and volumes.
+  - `--remove-orphans`: also removes any extra containers matching the project.
+  - `--volumes`: removes non-external named volumes declared by the project.
+- `compose ps`:
+  - Lists runtime container status (ID, image, status, ports), filtered by project using labels or name prefix.
+- `compose logs`:
+  - Streams logs for selected services or all services by project, with service name prefixes. Supports `--follow`, `--tail` (best-effort), and `-t/--timestamps` formatting in CLI.
+- `compose exec`:
+  - Executes a command in a running service container (`-i`, `-t`, `-u`, `-w`, `-e` supported). Detach returns immediately; otherwise returns the exit code of the command.
+
+## Environment Variables
+
+- The plugin loads variables from `.env` for compose file interpolation (matching Docker Compose precedence):
+  - CLI loads from the current working directory.
+  - Parser loads from the directory of the compose file when parsing by URL.
+- Precedence: shell environment overrides `.env` values. Variables already set in the environment are not overwritten by `.env`.
+- You can also pass variables explicitly with `--env KEY=VALUE` (repeatable).
+- `.env` loading is applied consistently across commands: `up`, `down`, `ps`, `start`, `logs`, `exec`, `validate`.
+- Security: the loader warns if `.env` is group/other readable; consider `chmod 600 .env`.
+
+## Compatibility and Limitations
+
+- YAML anchors and merge keys are disabled by default for hardening. You can enable them with `--allow-anchors` on compose commands.
+- Health gating and container recreation flags (`--force-recreate`, `--no-recreate`) are not fully implemented yet.
+- `ps`, `logs`, and `exec` implementations are limited and may not reflect full runtime state.
 
 ## Documentation
 

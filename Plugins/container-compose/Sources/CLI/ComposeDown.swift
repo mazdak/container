@@ -45,7 +45,7 @@ struct ComposeDown: AsyncParsableCommand {
         composeOptions.setEnvironmentVariables()
         
         // Parse compose file
-        let parser = ComposeParser(log: log)
+        let parser = ComposeParser(log: log, allowAnchors: global.allowAnchors)
         let composeFile = try parser.parse(from: composeOptions.getComposeFileURLs())
         
         // Convert to project
@@ -71,7 +71,7 @@ struct ComposeDown: AsyncParsableCommand {
         let orchestrator = Orchestrator(log: log)
         
         // Stop services
-        try await orchestrator.down(
+        let result = try await orchestrator.down(
             project: project,
             removeVolumes: volumes,
             removeOrphans: removeOrphans,
@@ -80,5 +80,13 @@ struct ComposeDown: AsyncParsableCommand {
         
         progress.finish()
         print("Stopped and removed project '\(project.name)'")
+        if !result.removedContainers.isEmpty {
+            print("Removed containers (\(result.removedContainers.count)):")
+            for c in result.removedContainers.sorted() { print("- \(c)") }
+        }
+        if !result.removedVolumes.isEmpty {
+            print("Removed volumes (\(result.removedVolumes.count)):")
+            for v in result.removedVolumes.sorted() { print("- \(v)") }
+        }
         }
     }

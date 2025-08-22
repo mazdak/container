@@ -228,4 +228,102 @@ struct DependencyResolverTests {
         #expect(resolution.parallelGroups.count == 1)
         #expect(resolution.parallelGroups[0] == ["web"])
     }
+
+    @Test
+    func testResolveDependsOnHealthy() throws {
+        let services: [String: Service] = [
+            "db": Service(name: "db", image: "postgres", healthCheck: HealthCheck(test: ["/bin/true"])),
+            "web": Service(name: "web", image: "nginx", dependsOnHealthy: ["db"])
+        ]
+
+        let resolution = try DependencyResolver.resolve(services: services)
+
+        #expect(resolution.startOrder == ["db", "web"])
+        #expect(resolution.stopOrder == ["web", "db"])
+        #expect(resolution.parallelGroups.count == 2)
+        #expect(resolution.parallelGroups[0] == ["db"])
+        #expect(resolution.parallelGroups[1] == ["web"])
+    }
+
+    @Test
+    func testResolveDependsOnStarted() throws {
+        let services: [String: Service] = [
+            "db": Service(name: "db", image: "postgres"),
+            "web": Service(name: "web", image: "nginx", dependsOnStarted: ["db"])
+        ]
+
+        let resolution = try DependencyResolver.resolve(services: services)
+
+        #expect(resolution.startOrder == ["db", "web"])
+        #expect(resolution.stopOrder == ["web", "db"])
+        #expect(resolution.parallelGroups.count == 2)
+        #expect(resolution.parallelGroups[0] == ["db"])
+        #expect(resolution.parallelGroups[1] == ["web"])
+    }
+
+    @Test
+    func testResolveDependsOnCompletedSuccessfully() throws {
+        let services: [String: Service] = [
+            "db": Service(name: "db", image: "postgres"),
+            "web": Service(name: "web", image: "nginx", dependsOnCompletedSuccessfully: ["db"])
+        ]
+
+        let resolution = try DependencyResolver.resolve(services: services)
+
+        #expect(resolution.startOrder == ["db", "web"])
+        #expect(resolution.stopOrder == ["web", "db"])
+        #expect(resolution.parallelGroups.count == 2)
+        #expect(resolution.parallelGroups[0] == ["db"])
+        #expect(resolution.parallelGroups[1] == ["web"])
+    }
+
+    @Test
+    func testResolveMultipleDependencyTypes() throws {
+        let services: [String: Service] = [
+            "db": Service(name: "db", image: "postgres", healthCheck: HealthCheck(test: ["/bin/true"])),
+            "cache": Service(name: "cache", image: "redis"),
+            "web": Service(name: "web", image: "nginx", dependsOnHealthy: ["db"], dependsOnStarted: ["cache"])
+        ]
+
+        let resolution = try DependencyResolver.resolve(services: services)
+
+        // db and cache have no dependencies, so they can start in parallel (order may vary due to sorting)
+        #expect(resolution.startOrder.count == 3)
+        #expect(resolution.startOrder.contains("db"))
+        #expect(resolution.startOrder.contains("cache"))
+        #expect(resolution.startOrder.contains("web"))
+        #expect(resolution.startOrder.last == "web") // web should be last
+
+        #expect(resolution.stopOrder.first == "web") // web should stop first
+        #expect(resolution.parallelGroups.count == 2) // Two parallel groups: [db,cache] and [web]
+        #expect(resolution.parallelGroups[0].count == 2) // First group has both db and cache
+        #expect(resolution.parallelGroups[1] == ["web"]) // Second group has only web
+    }
+
+    @Test
+    func testResolveMixedDependencies() throws {
+        let services: [String: Service] = [
+            "db": Service(name: "db", image: "postgres", healthCheck: HealthCheck(test: ["/bin/true"])),
+            "cache": Service(name: "cache", image: "redis"),
+            "api": Service(name: "api", image: "api", dependsOn: ["db"], dependsOnStarted: ["cache"]),
+            "web": Service(name: "web", image: "nginx", dependsOn: ["api"], dependsOnHealthy: ["db"])
+        ]
+
+        let resolution = try DependencyResolver.resolve(services: services)
+
+        // db and cache should start first (parallel)
+        #expect(resolution.parallelGroups[0].contains("db"))
+        #expect(resolution.parallelGroups[0].contains("cache"))
+
+        // api should start after db and cache
+        let apiIndex = resolution.startOrder.firstIndex(of: "api")!
+        let dbIndex = resolution.startOrder.firstIndex(of: "db")!
+        let cacheIndex = resolution.startOrder.firstIndex(of: "cache")!
+
+        #expect(apiIndex > dbIndex)
+        #expect(apiIndex > cacheIndex)
+
+        // web should be last
+        #expect(resolution.startOrder.last == "web")
+    }
 }

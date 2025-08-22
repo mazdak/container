@@ -15,6 +15,7 @@
 //===----------------------------------------------------------------------===//
 
 import Foundation
+import CryptoKit
 
 /// Represents a parsed and normalized compose project
 public struct Project: Sendable {
@@ -128,25 +129,24 @@ public struct Service: Sendable {
         self.memory = memory
     }
 
-    /// Returns true if this service needs to be built
-    public var needsBuild: Bool {
-        return build != nil && image == nil
-    }
+    /// Returns true if this service has a build configuration
+    /// Compose semantics: build may be present with or without image
+    public var hasBuild: Bool { build != nil }
 
     /// Returns the effective image name for this service
-    /// If an image is specified, uses that. Otherwise generates one based on build context.
+    /// If an image is specified, uses that. Otherwise returns a deterministic tag for builds.
     public func effectiveImageName(projectName: String) -> String {
-        if let image = image {
-            return image
-        } else if let build = build {
-            // Generate a deterministic image name based on build context
-            let context = build.context ?? "."
-            let dockerfile = build.dockerfile ?? "Dockerfile"
-            let contextHash = String(context.hashValue) + String(dockerfile.hashValue)
-            return "\(projectName)_\(name):\(abs(Int(contextHash) ?? 0))"
-        } else {
-            return "unknown"
-        }
+        if let image = image { return image }
+        guard let build = build else { return "unknown" }
+        let context = build.context ?? "."
+        let dockerfile = build.dockerfile ?? "Dockerfile"
+        let args = build.args ?? [:]
+        let argsString = args.keys.sorted().map { key in "\(key)=\(args[key] ?? "")" }.joined(separator: ";")
+        let material = [projectName, name, context, dockerfile, argsString].joined(separator: "|")
+        let digest = SHA256.hash(data: material.data(using: .utf8)!)
+        let fingerprint = digest.compactMap { String(format: "%02x", $0) }.joined()
+        let short = String(fingerprint.prefix(12))
+        return "\(projectName)_\(name):\(short)"
     }
 }
 

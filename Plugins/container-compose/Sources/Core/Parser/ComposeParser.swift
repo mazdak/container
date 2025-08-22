@@ -18,14 +18,17 @@ import Foundation
 import Yams
 import ContainerizationError
 import Logging
+import ComposeCore
 
 public struct ComposeParser {
     private let log: Logger
     private let merger: ComposeFileMerger
+    private let allowAnchors: Bool
     
-    public init(log: Logger) {
+    public init(log: Logger, allowAnchors: Bool = false) {
         self.log = log
         self.merger = ComposeFileMerger(log: log)
+        self.allowAnchors = allowAnchors
     }
     
     /// Parse and merge multiple docker-compose files
@@ -36,10 +39,12 @@ public struct ComposeParser {
                 message: "No compose files specified"
             )
         }
-        
+
         var composeFiles: [ComposeFile] = []
-        
+
         for url in urls {
+            // Load .env for each file directory (Compose precedence: shell env overrides .env)
+            _ = EnvLoader.load(from: url.deletingLastPathComponent(), export: true, override: false, logger: log)
             let file = try parseWithoutValidation(from: url)
             composeFiles.append(file)
             log.info("Loaded compose file: \(url.lastPathComponent)")
@@ -66,7 +71,10 @@ public struct ComposeParser {
                 message: "Compose file not found at path: \(url.path)"
             )
         }
-        
+
+        // Load .env from the compose file directory for interpolation if present
+        _ = EnvLoader.load(from: url.deletingLastPathComponent(), export: true, override: false, logger: log)
+
         let data = try Data(contentsOf: url)
         return try parse(from: data)
     }
@@ -183,11 +191,13 @@ public struct ComposeParser {
         }
 
         // Check for YAML anchors and merge keys that can cause DoS
-        if yamlString.contains("&") || yamlString.contains("<<:") {
-            throw ContainerizationError(
-                .invalidArgument,
-                message: "YAML anchors and merge keys are not allowed for security reasons"
-            )
+        if !allowAnchors {
+            if yamlString.contains("&") || yamlString.contains("<<:") {
+                throw ContainerizationError(
+                    .invalidArgument,
+                    message: "YAML anchors and merge keys are not allowed for security reasons (use --allow-anchors to override)"
+                )
+            }
         }
 
         // Check file size limit (prevent DoS with extremely large files)

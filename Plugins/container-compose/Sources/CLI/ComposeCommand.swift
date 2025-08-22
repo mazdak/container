@@ -17,6 +17,7 @@
 import ArgumentParser
 import ContainerClient
 import Foundation
+import ComposeCore
 
 // This file now contains only shared options
 // The main command is defined in main.swift
@@ -102,24 +103,7 @@ struct ComposeOptions: ParsableArguments {
     /// Load .env from current working directory and export vars into process env
     /// Compose uses .env for interpolation; we approximate by exporting to env before parsing
     func loadDotEnvIfPresent() {
-        let cwd = FileManager.default.currentDirectoryPath
-        let dotEnvURL = URL(fileURLWithPath: cwd).appendingPathComponent(".env")
-        guard FileManager.default.fileExists(atPath: dotEnvURL.path) else { return }
-        if let contents = try? String(contentsOf: dotEnvURL, encoding: .utf8) {
-            for line in contents.split(whereSeparator: { $0.isNewline }) {
-                var s = String(line).trimmingCharacters(in: .whitespaces)
-                if s.isEmpty || s.hasPrefix("#") { continue }
-                if s.hasPrefix("export ") { s.removeFirst("export ".count) }
-                let parts = s.split(separator: "=", maxSplits: 1)
-                if parts.count == 2 {
-                    let key = String(parts[0]).trimmingCharacters(in: .whitespaces)
-                    var val = String(parts[1]).trimmingCharacters(in: .whitespaces)
-                    if (val.hasPrefix("\"") && val.hasSuffix("\"")) || (val.hasPrefix("'") && val.hasSuffix("'")) {
-                        val = String(val.dropFirst().dropLast())
-                    }
-                    setenv(key, val, 1) // override to ensure deterministic interpolation in this process
-                }
-            }
-        }
+        let cwd = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        _ = EnvLoader.load(from: cwd, export: true, override: false)
     }
 }

@@ -95,7 +95,10 @@ public struct DependencyResolver {
         
         // Build dependency graph
         for (name, service) in services {
-            for dependency in service.dependsOn {
+            // Handle all dependency types
+            let allDependencies = service.dependsOn + service.dependsOnHealthy + service.dependsOnStarted + service.dependsOnCompletedSuccessfully
+
+            for dependency in allDependencies {
                 // Validate dependency exists
                 guard services[dependency] != nil else {
                     throw ContainerizationError(
@@ -103,7 +106,7 @@ public struct DependencyResolver {
                         message: "Service '\(name)' depends on unknown service '\(dependency)'"
                     )
                 }
-                
+
                 // Add edge from dependency to dependent
                 graph[dependency]!.insert(name)
                 inDegree[name]! += 1
@@ -180,7 +183,9 @@ public struct DependencyResolver {
             recursionStack.insert(service)
             
             if let serviceConfig = services[service] {
-                for dependency in serviceConfig.dependsOn {
+                // Check all dependency types for cycles
+                let allDependencies = serviceConfig.dependsOn + serviceConfig.dependsOnHealthy + serviceConfig.dependsOnStarted + serviceConfig.dependsOnCompletedSuccessfully
+                for dependency in allDependencies {
                     try hasCycle(service: dependency, path: path + [service])
                 }
             }
@@ -221,8 +226,9 @@ public struct DependencyResolver {
             
             result[current] = service
             
-            // Add dependencies
-            for dep in service.dependsOn {
+            // Add all types of dependencies
+            let allDependencies = service.dependsOn + service.dependsOnHealthy + service.dependsOnStarted + service.dependsOnCompletedSuccessfully
+            for dep in allDependencies {
                 toProcess.insert(dep)
             }
         }

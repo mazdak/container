@@ -37,11 +37,12 @@ struct ComposeStart: AsyncParsableCommand {
         var services: [String] = []
         
         func run() async throws {
-        // Set environment variables
+        // Load .env and set environment variables
+        composeOptions.loadDotEnvIfPresent()
         composeOptions.setEnvironmentVariables()
         
         // Parse compose file
-        let parser = ComposeParser(log: log)
+        let parser = ComposeParser(log: log, allowAnchors: global.allowAnchors)
         let composeFile = try parser.parse(from: composeOptions.getComposeFileURLs())
         
         // Convert to project

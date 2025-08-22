@@ -25,6 +25,9 @@ struct Flags {
     struct Global: ParsableArguments {
         @Flag(name: .shortAndLong, help: "Enable debug logging")
         var debug = false
+
+        @Flag(name: .long, help: "Allow YAML anchors and merge keys in compose files")
+        var allowAnchors = false
     }
 }
 

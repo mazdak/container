@@ -15,6 +15,7 @@
 //===----------------------------------------------------------------------===//
 
 import Foundation
+import CryptoKit
 import ContainerClient
 import Containerization
 import ContainerizationError
@@ -95,6 +96,7 @@ public protocol BuildService: Sendable {
         serviceName: String,
         buildConfig: BuildConfig,
         projectName: String,
+        targetTag: String,
         progressHandler: ProgressUpdateHandler?
     ) async throws -> String
 }
@@ -110,22 +112,25 @@ public struct DefaultBuildService: BuildService {
         serviceName: String,
         buildConfig: BuildConfig,
         projectName: String,
+        targetTag: String,
         progressHandler: ProgressUpdateHandler?
     ) async throws -> String {
-        // Generate unique image name
-        let imageName = "\(projectName)_\(serviceName):\(UUID().uuidString.prefix(8))"
-
         do {
             // Validate build configuration
             let contextDir = buildConfig.context ?? "."
-            let dockerfilePath = buildConfig.dockerfile ?? "Dockerfile"
+            let dockerfilePathRaw = buildConfig.dockerfile ?? "Dockerfile"
 
             // Check if dockerfile exists
-            let dockerfileURL = URL(fileURLWithPath: dockerfilePath)
+            // Resolve dockerfile relative to context if needed
+            let dockerfileURL: URL = {
+                let url = URL(fileURLWithPath: dockerfilePathRaw)
+                if url.path.hasPrefix("/") { return url }
+                return URL(fileURLWithPath: contextDir).appendingPathComponent(dockerfilePathRaw)
+            }()
             guard FileManager.default.fileExists(atPath: dockerfileURL.path) else {
                 throw ContainerizationError(
                     .notFound,
-                    message: "Dockerfile not found at path '\(dockerfilePath)' for service '\(serviceName)'"
+                    message: "Dockerfile not found at path '\(dockerfileURL.path)' for service '\(serviceName)'"
                 )
             }
 
@@ -142,13 +147,13 @@ public struct DefaultBuildService: BuildService {
             try await buildImageWithCLI(
                 serviceName: serviceName,
                 buildConfig: buildConfig,
-                imageName: imageName,
+                imageName: targetTag,
                 contextDir: contextDir,
-                dockerfilePath: dockerfilePath
+                dockerfilePath: dockerfileURL.path
             )
 
-            log.info("Successfully built image \(imageName) for service \(serviceName)")
-            return imageName
+            log.info("Successfully built image \(targetTag) for service \(serviceName)")
+            return targetTag
 
         } catch let error as ContainerizationError {
             // Re-throw ContainerizationErrors as-is
@@ -190,8 +195,10 @@ public struct DefaultBuildService: BuildService {
 
         // Add build args
         if let buildArgs = buildConfig.args {
-            for (key, value) in buildArgs {
-                arguments.append(contentsOf: ["--build-arg", "\(key)=\(value)"])
+            for key in buildArgs.keys.sorted() {
+                if let value = buildArgs[key] {
+                    arguments.append(contentsOf: ["--build-arg", "\(key)=\(value)"])
+                }
             }
         }
 
@@ -373,6 +380,7 @@ public actor Orchestrator {
     /// State of a project
     private struct ProjectState {
         var containers: [String: ContainerState] = [:]
+        var lastAccessed: Date = Date()
     }
 
     /// Container status
@@ -409,6 +417,15 @@ public actor Orchestrator {
             self.status = status
             self.ports = ports
             self.image = image
+        }
+    }
+
+    public struct DownResult: Sendable {
+        public let removedContainers: [String]
+        public let removedVolumes: [String]
+        public init(removedContainers: [String], removedVolumes: [String]) {
+            self.removedContainers = removedContainers
+            self.removedVolumes = removedVolumes
         }
     }
 
@@ -484,7 +501,7 @@ public actor Orchestrator {
         do {
             log.info("Checking if images need to be built for \(targetServices.count) services")
             for (name, service) in targetServices {
-                log.info("Service '\(name)': needsBuild=\(service.needsBuild), image=\(service.image ?? "nil"), build=\(service.build != nil ? "present" : "nil")")
+                log.info("Service '\(name)': hasBuild=\(service.hasBuild), image=\(service.image ?? "nil"), build=\(service.build != nil ? "present" : "nil")")
             }
 
             try await buildImagesIfNeeded(
@@ -503,6 +520,14 @@ public actor Orchestrator {
         // Initialize project state
         if projectState[project.name] == nil {
             projectState[project.name] = ProjectState()
+        } else {
+            // Update access time for existing project
+            updateProjectAccess(projectName: project.name)
+        }
+
+        // Optionally remove orphans by inspecting runtime containers
+        if removeOrphans {
+            await removeOrphanContainers(project: project)
         }
 
         // Create and start containers for services
@@ -515,7 +540,51 @@ public actor Orchestrator {
             progressHandler: progressHandler
         )
 
+        // Clean up old project states to prevent memory leaks
+        cleanupOldProjectStates()
+
         log.info("Project '\(project.name)' started successfully")
+    }
+
+
+
+    /// Clean up old project states to prevent memory leaks
+    private func cleanupOldProjectStates() {
+        let cutoffDate = Date().addingTimeInterval(-3600) // 1 hour ago
+        let oldProjects = projectState.filter { $0.value.lastAccessed < cutoffDate }
+
+        for (projectName, _) in oldProjects {
+            log.info("Cleaning up old project state for '\(projectName)'")
+            projectState[projectName] = nil
+        }
+
+        if !oldProjects.isEmpty {
+            log.info("Cleaned up \(oldProjects.count) old project states")
+        }
+    }
+
+    /// Update last accessed time for a project
+    private func updateProjectAccess(projectName: String) {
+        if var state = projectState[projectName] {
+            state.lastAccessed = Date()
+            projectState[projectName] = state
+        }
+    }
+
+    /// Remove named volumes for a project
+    private func removeNamedVolumes(project: Project, progressHandler: ProgressUpdateHandler?) async {
+        // Implementation for removing named volumes
+        // This would need to be implemented based on the volume management system
+        log.info("Volume removal not yet implemented for project '\(project.name)'")
+    }
+
+
+
+    /// Cancel health monitors for a project
+    private func cancelHealthMonitors(projectName: String) {
+        guard let map = healthMonitors[projectName] else { return }
+        for (_, task) in map { task.cancel() }
+        healthMonitors[projectName] = [:]
     }
 
     /// Create and start containers for services
@@ -561,30 +630,131 @@ public actor Orchestrator {
         noRecreate: Bool,
         progressHandler: ProgressUpdateHandler?
     ) async throws {
-        log.info("Starting service '\(serviceName)' with image '\(service.effectiveImageName(projectName: project.name))', needsBuild: \(service.needsBuild)")
+        log.info("Starting service '\(serviceName)' with image '\(service.effectiveImageName(projectName: project.name))', hasBuild: \(service.hasBuild)")
 
-        // Get the effective image name (either original or built)
+        let containerId = service.containerName ?? "\(project.name)_\(serviceName)"
+
+        // Handle existing container logic
+        try await handleExistingContainer(
+            project: project,
+            serviceName: serviceName,
+            service: service,
+            containerId: containerId,
+            forceRecreate: forceRecreate,
+            noRecreate: noRecreate
+        )
+
+        // Ensure image is available for build services
         let imageName = service.effectiveImageName(projectName: project.name)
+        try await ensureImageAvailable(serviceName: serviceName, service: service, imageName: imageName)
 
-        // Get the default kernel
-        let kernel = try await ClientKernel.getDefaultKernel(for: .current)
+        // Create and start new container
+        try await createAndStartNewContainer(
+            project: project,
+            serviceName: serviceName,
+            service: service,
+            containerId: containerId,
+            imageName: imageName,
+            progressHandler: progressHandler
+        )
+    }
 
-        // For services that need building, ensure the image is built first
-        if service.needsBuild {
-            log.info("Service '\(serviceName)' needs building, ensuring image is available")
-            // The image should have been built during buildImagesIfNeeded
-            // Now try to get the actual built image
-            do {
-                _ = try await ClientImage.get(reference: imageName)
-                log.info("Found built image '\(imageName)' for service '\(serviceName)'")
-            } catch {
-                log.error("Built image '\(imageName)' not found for service '\(serviceName)': \(error)")
-                throw ContainerizationError(
-                    .notFound,
-                    message: "Built image '\(imageName)' not found for service '\(serviceName)'. Build may have failed."
+    /// Handle existing container logic (reuse, recreate, or skip)
+    private func handleExistingContainer(
+        project: Project,
+        serviceName: String,
+        service: Service,
+        containerId: String,
+        forceRecreate: Bool,
+        noRecreate: Bool
+    ) async throws {
+        guard let existing = try? await findRuntimeContainer(byId: containerId) else {
+            return // No existing container, proceed with creation
+        }
+
+        if noRecreate {
+            log.info("Reusing existing container '\(existing.id)' for service '\(serviceName)' (no-recreate)")
+            // Track in state if missing
+            if projectState[project.name]?.containers[serviceName] == nil {
+                projectState[project.name]?.containers[serviceName] = ContainerState(
+                    serviceName: serviceName,
+                    containerID: existing.id,
+                    containerName: containerId,
+                    status: .starting
                 )
             }
+            return
         }
+
+        if !forceRecreate {
+            // Check if configuration has changed
+            let imageName = service.effectiveImageName(projectName: project.name)
+            let expectedHash = computeConfigHash(
+                project: project,
+                serviceName: serviceName,
+                service: service,
+                imageName: imageName,
+                process: ProcessConfiguration(
+                    executable: service.command?.first ?? "/bin/sh",
+                    arguments: Array((service.command ?? ["/bin/sh", "-c"]).dropFirst()),
+                    environment: service.environment.map { "\($0.key)=\($0.value)" },
+                    workingDirectory: service.workingDir ?? "/"
+                ),
+                ports: service.ports.map { port in
+                    PublishPort(hostAddress: port.hostIP ?? "0.0.0.0",
+                                hostPort: Int(port.hostPort) ?? 0,
+                                containerPort: Int(port.containerPort) ?? 0,
+                                proto: port.portProtocol == "tcp" ? .tcp : .udp)
+                },
+                mounts: service.volumes.map { v in
+                    Filesystem(type: v.type == .bind ? .volume(name: "", format: "ext4", cache: .auto, sync: .full) : .volume(name: v.source, format: "ext4", cache: .auto, sync: .full),
+                               source: v.source,
+                               destination: v.target,
+                               options: v.readOnly ? ["ro"] : [])
+                }
+            )
+            let currentHash = existing.configuration.labels["com.apple.container.compose.config-hash"]
+            if currentHash == expectedHash {
+                log.info("Reusing existing container '\(existing.id)' for service '\(serviceName)' (config unchanged)")
+                return
+            }
+        }
+
+        // Recreate the container
+        log.info("Recreating existing container '\(existing.id)' for service '\(serviceName)'")
+        do { try await existing.stop() } catch { log.warning("failed to stop \(existing.id): \(error)") }
+        do { try await existing.delete() } catch { log.warning("failed to delete \(existing.id): \(error)") }
+        projectState[project.name]?.containers.removeValue(forKey: serviceName)
+    }
+
+    /// Ensure the image is available for services that need building
+    private func ensureImageAvailable(serviceName: String, service: Service, imageName: String) async throws {
+        guard service.hasBuild else { return }
+
+        log.info("Service '\(serviceName)' needs building, ensuring image is available")
+        do {
+            _ = try await ClientImage.get(reference: imageName)
+            log.info("Found built image '\(imageName)' for service '\(serviceName)'")
+        } catch {
+            log.error("Built image '\(imageName)' not found for service '\(serviceName)': \(error)")
+            throw ContainerizationError(
+                .notFound,
+                message: "Built image '\(imageName)' not found for service '\(serviceName)'. Build may have failed."
+            )
+        }
+    }
+
+    /// Create and start a new container for the service
+    private func createAndStartNewContainer(
+        project: Project,
+        serviceName: String,
+        service: Service,
+        containerId: String,
+        imageName: String,
+        progressHandler: ProgressUpdateHandler?
+    ) async throws {
+        // Get the default kernel
+        let kernel = try await ClientKernel.getDefaultKernel(for: .current)
 
         // Create container configuration
         let containerConfig = try await createContainerConfiguration(
@@ -604,7 +774,7 @@ public actor Orchestrator {
         projectState[project.name]?.containers[serviceName] = ContainerState(
             serviceName: serviceName,
             containerID: container.id,
-            containerName: service.containerName ?? "\(project.name)_\(serviceName)",
+            containerName: containerId,
             status: .created
         )
 
@@ -615,6 +785,44 @@ public actor Orchestrator {
         projectState[project.name]?.containers[serviceName]?.status = .starting
 
         log.info("Started service '\(serviceName)' with container '\(container.id)'")
+    }
+
+    private func findRuntimeContainer(byId id: String) async throws -> ClientContainer? {
+        let all = try await ClientContainer.list()
+        return all.first { $0.id == id }
+    }
+
+    private func expectedContainerIds(for project: Project) -> Set<String> {
+        Set(project.services.map { name, svc in svc.containerName ?? "\(project.name)_\(name)" })
+    }
+
+    private func removeOrphanContainers(project: Project) async {
+        do {
+            let expectedServices = Set(project.services.keys)
+            let all = try await ClientContainer.list()
+            let orphans = all.filter { c in
+                // Prefer labels if present
+                if let proj = c.configuration.labels["com.apple.compose.project"], proj == project.name {
+                    let svc = c.configuration.labels["com.apple.compose.service"] ?? ""
+                    return !expectedServices.contains(svc)
+                }
+                // Fallback: prefix-based
+                let prefix = "\(project.name)_"
+                let id = c.id
+                if id.hasPrefix(prefix) {
+                    let svc = String(id.dropFirst(prefix.count))
+                    return !expectedServices.contains(svc)
+                }
+                return false
+            }
+            for c in orphans {
+                log.info("Removing orphan container '\(c.id)'")
+                try? await c.stop()
+                try? await c.delete()
+            }
+        } catch {
+            log.warning("Failed to evaluate/remove orphans: \(error)")
+        }
     }
 
     /// Create container configuration for a service
@@ -643,8 +851,21 @@ public actor Orchestrator {
             process: processConfig
         )
 
-        // Add labels
-        config.labels = service.labels
+        // Add labels (merge user labels)
+        var labels = service.labels
+        labels["com.apple.compose.project"] = project.name
+        labels["com.apple.compose.service"] = serviceName
+        labels["com.apple.compose.container"] = config.id
+        labels["com.apple.container.compose.config-hash"] = computeConfigHash(
+            project: project,
+            serviceName: serviceName,
+            service: service,
+            imageName: imageName,
+            process: processConfig,
+            ports: config.publishedPorts,
+            mounts: config.mounts
+        )
+        config.labels = labels
 
         // Add port mappings
         config.publishedPorts = service.ports.map { port in
@@ -677,6 +898,121 @@ public actor Orchestrator {
         return config
     }
 
+    private func computeConfigHash(
+        project: Project,
+        serviceName: String,
+        service: Service,
+        imageName: String,
+        process: ProcessConfiguration,
+        ports: [PublishPort],
+        mounts: [Filesystem]
+    ) -> String {
+        let sig = ConfigSignature(
+            image: imageName,
+            executable: process.executable,
+            arguments: process.arguments,
+            workdir: process.workingDirectory,
+            environment: process.environment,
+            cpus: service.cpus,
+            memory: service.memory,
+            ports: ports.map { PortSig(host: $0.hostAddress, hostPort: $0.hostPort, containerPort: $0.containerPort, proto: $0.proto == .tcp ? "tcp" : "udp") },
+            mounts: mounts.map { MountSig(source: $0.source, destination: $0.destination, options: $0.options) },
+            labels: service.labels,
+            health: service.healthCheck.map { HealthSig(test: $0.test, interval: $0.interval, timeout: $0.timeout, retries: $0.retries, startPeriod: $0.startPeriod) }
+        )
+        return sig.digest()
+    }
+
+    private struct ConfigSignature: Codable {
+        let image: String
+        let executable: String
+        let arguments: [String]
+        let workdir: String
+        let environment: [String]
+        let cpus: String?
+        let memory: String?
+        let ports: [PortSig]
+        let mounts: [MountSig]
+        let labels: [String: String]
+        let health: HealthSig?
+
+        func canonicalJSON() -> String {
+            let enc = JSONEncoder()
+            enc.outputFormatting = [.sortedKeys]
+            // normalize arrays by sorting where order is insignificant
+            let sortedEnv = environment.sorted()
+            let sortedArgs = arguments
+            let sortedPorts = ports.sorted { $0.key < $1.key }
+            let sortedMounts = mounts.sorted { $0.key < $1.key }
+            let sortedLabels: [LabelSig] = labels
+                .sorted { $0.key < $1.key }
+                .map { LabelSig(key: $0.key, value: $0.value) }
+            let payload = Canonical(
+                image: image,
+                executable: executable,
+                arguments: sortedArgs,
+                workdir: workdir,
+                environment: sortedEnv,
+                cpus: cpus,
+                memory: memory,
+                ports: sortedPorts,
+                mounts: sortedMounts,
+                labels: sortedLabels,
+                health: health
+            )
+            let data = try! enc.encode(payload)
+            return String(data: data, encoding: .utf8)!
+        }
+
+        func digest() -> String {
+            let json = canonicalJSON()
+            let d = SHA256.hash(data: json.data(using: .utf8)!)
+            return d.compactMap { String(format: "%02x", $0) }.joined()
+        }
+
+        struct Canonical: Codable {
+            let image: String
+            let executable: String
+            let arguments: [String]
+            let workdir: String
+            let environment: [String]
+            let cpus: String?
+            let memory: String?
+            let ports: [PortSig]
+            let mounts: [MountSig]
+            let labels: [LabelSig]
+            let health: HealthSig?
+        }
+    }
+
+    private struct LabelSig: Codable {
+        let key: String
+        let value: String
+    }
+
+    private struct PortSig: Codable {
+        let host: String
+        let hostPort: Int
+        let containerPort: Int
+        let proto: String
+        var key: String { "\(host):\(hostPort)->\(containerPort)/\(proto)" }
+    }
+
+    private struct MountSig: Codable {
+        let source: String
+        let destination: String
+        let options: [String]
+        var key: String { "\(destination)=\(source):\(options.sorted().joined(separator: ","))" }
+    }
+
+    private struct HealthSig: Codable {
+        let test: [String]
+        let interval: TimeInterval?
+        let timeout: TimeInterval?
+        let retries: Int?
+        let startPeriod: TimeInterval?
+    }
+
     /// Build images for services that need building
     private func buildImagesIfNeeded(
         project: Project,
@@ -684,7 +1020,7 @@ public actor Orchestrator {
         progressHandler: ProgressUpdateHandler?
     ) async throws {
         // Find services that need building
-        let servicesToBuild = services.filter { $0.value.needsBuild }
+        let servicesToBuild = services.filter { $0.value.hasBuild }
 
         if servicesToBuild.isEmpty {
             log.debug("No services need building")
@@ -747,10 +1083,12 @@ public actor Orchestrator {
             while activeBuilds < maxConcurrentBuilds, let nextBuild = buildsIterator.next() {
                 activeBuilds += 1
                 group.addTask {
+                    let targetTag = nextBuild.1.effectiveImageName(projectName: project.name)
                     let imageName = try await self.buildSingleImage(
                         serviceName: nextBuild.0,
                         service: nextBuild.1,
                         project: project,
+                        targetTag: targetTag,
                         progressHandler: progressHandler
                     )
                     return (nextBuild.0, imageName)
@@ -771,10 +1109,12 @@ public actor Orchestrator {
                 if let nextBuild = buildsIterator.next() {
                     activeBuilds += 1
                     group.addTask {
+                        let targetTag = nextBuild.1.effectiveImageName(projectName: project.name)
                         let imageName = try await self.buildSingleImage(
                             serviceName: nextBuild.0,
                             service: nextBuild.1,
                             project: project,
+                            targetTag: targetTag,
                             progressHandler: progressHandler
                         )
                         return (nextBuild.0, imageName)
@@ -789,6 +1129,7 @@ public actor Orchestrator {
         serviceName: String,
         service: Service,
         project: Project,
+        targetTag: String,
         progressHandler: ProgressUpdateHandler?
     ) async throws -> String {
         guard let buildConfig = service.build else {
@@ -805,6 +1146,7 @@ public actor Orchestrator {
                 serviceName: serviceName,
                 buildConfig: buildConfig,
                 projectName: project.name,
+                targetTag: targetTag,
                 progressHandler: progressHandler
             )
 
@@ -828,10 +1170,10 @@ public actor Orchestrator {
         let context = buildConfig.context ?? "."
         let dockerfile = buildConfig.dockerfile ?? "Dockerfile"
         let args = buildConfig.args ?? [:]
-
-        // Create a deterministic hash based on build parameters
-        let hashString = "\(projectName):\(serviceName):\(context):\(dockerfile):\(args.description)"
-        return String(hashString.hashValue)
+        let argsString = args.keys.sorted().map { key in "\(key)=\(args[key] ?? "")" }.joined(separator: ";")
+        let key = "\(projectName)|\(serviceName)|\(context)|\(dockerfile)|\(argsString)"
+        let digest = SHA256.hash(data: key.data(using: .utf8)!)
+        return digest.compactMap { String(format: "%02x", $0) }.joined()
     }
 
     /// Stop and remove services in a project
@@ -840,19 +1182,84 @@ public actor Orchestrator {
         removeVolumes: Bool = false,
         removeOrphans: Bool = false,
         progressHandler: ProgressUpdateHandler? = nil
-    ) async throws {
+    ) async throws -> DownResult {
         log.info("Stopping project '\(project.name)'")
+
+        // Determine containers to remove
+        let prefix = "\(project.name)_"
+        let expectedIds: Set<String> = Set(project.services.map { name, svc in
+            svc.containerName ?? "\(project.name)_\(name)"
+        })
+
+        var removedContainers: [String] = []
+        do {
+            let all = try await ClientContainer.list()
+            let targets: [ClientContainer] = all.filter { container in
+                if removeOrphans {
+                    return container.id.hasPrefix(prefix)
+                } else {
+                    return expectedIds.contains(container.id)
+                }
+            }
+
+            for c in targets {
+                // Best-effort stop then delete
+                do { try await c.stop() } catch { log.warning("failed to stop \(c.id): \(error)") }
+                do { try await c.delete() } catch { log.warning("failed to delete \(c.id): \(error)") }
+                removedContainers.append(c.id)
+            }
+        } catch {
+            log.warning("Failed to enumerate project containers: \(error)")
+        }
+
+        // Optionally remove volumes defined in the project (non-external)
+        var removedVolumes: [String] = []
+        if removeVolumes {
+            for (_, vol) in project.volumes {
+                if !vol.external {
+                    do { try await ClientVolume.delete(name: vol.name); removedVolumes.append(vol.name) }
+                    catch { log.warning("failed to delete volume \(vol.name): \(error)") }
+                }
+            }
+        }
 
         // Clear project state
         projectState[project.name] = nil
 
         log.info("Project '\(project.name)' stopped and removed")
+        return DownResult(removedContainers: removedContainers, removedVolumes: removedVolumes)
     }
 
     /// Get service statuses
     public func ps(project: Project) async throws -> [ServiceStatus] {
-        // Return empty status for now - build functionality doesn't need this
-        return []
+        let idToService: [String: String] = Dictionary(uniqueKeysWithValues: project.services.map { (name, svc) in
+            let id = svc.containerName ?? "\(project.name)_\(name)"
+            return (id, name)
+        })
+        let containers = try await ClientContainer.list()
+        let filtered = containers.filter { c in
+            if let proj = c.configuration.labels["com.apple.compose.project"], proj == project.name { return true }
+            // Fallback to prefix if labels are missing
+            return c.id.hasPrefix("\(project.name)_")
+        }
+        var statuses: [ServiceStatus] = []
+        for c in filtered {
+            let serviceName = c.configuration.labels["com.apple.compose.service"] ?? idToService[c.id] ?? c.id
+            let portsStr: String = c.configuration.publishedPorts.map { p in
+                let host = p.hostAddress
+                return "\(host):\(p.hostPort)->\(p.containerPort)/\(p.proto == .tcp ? "tcp" : "udp")"
+            }.joined(separator: ", ")
+            let statusStr = c.status.rawValue
+            let imageRef = c.configuration.image.reference
+            let shortId = String(c.id.prefix(12))
+            statuses.append(ServiceStatus(name: serviceName,
+                                          containerID: shortId,
+                                          containerName: c.id,
+                                          status: statusStr,
+                                          ports: portsStr,
+                                          image: imageRef))
+        }
+        return statuses
     }
 
     /// Get logs from services
@@ -863,9 +1270,87 @@ public actor Orchestrator {
         tail: Int? = nil,
         timestamps: Bool = false
     ) async throws -> AsyncThrowingStream<LogEntry, Error> {
-        // Return empty stream for now - build functionality doesn't need this
+        // Resolve target services
+        let selected = services.isEmpty ? Set(project.services.keys) : Set(services)
+
+        // Find matching containers (prefer labels)
+        let all = try await ClientContainer.list()
+        var targets: [(service: String, container: ClientContainer)] = []
+        for c in all {
+            if let proj = c.configuration.labels["com.apple.compose.project"], proj == project.name {
+                let svc = c.configuration.labels["com.apple.compose.service"] ?? c.id
+                if services.isEmpty || selected.contains(svc) {
+                    targets.append((svc, c))
+                }
+                continue
+            }
+            // Fallback by id
+            let prefix = "\(project.name)_"
+            if c.id.hasPrefix(prefix) {
+                let svc = String(c.id.dropFirst(prefix.count))
+                if services.isEmpty || selected.contains(svc) {
+                    targets.append((svc, c))
+                }
+            }
+        }
+
         return AsyncThrowingStream { continuation in
-            continuation.finish()
+            // If no targets, finish immediately
+            if targets.isEmpty { continuation.finish(); return }
+
+            final class Emitter: @unchecked Sendable {
+                let cont: AsyncThrowingStream<LogEntry, Error>.Continuation
+                init(_ c: AsyncThrowingStream<LogEntry, Error>.Continuation) { self.cont = c }
+                func emit(_ svc: String, _ stream: LogEntry.LogStream, data: Data) {
+                    guard !data.isEmpty else { return }
+                    if let text = String(data: data, encoding: .utf8) {
+                        for line in text.split(whereSeparator: { $0.isNewline }) {
+                            cont.yield(LogEntry(serviceName: svc, message: String(line), stream: stream))
+                        }
+                    }
+                }
+                func finish() { cont.finish() }
+                func fail(_ error: Error) { cont.yield(with: .failure(error)) }
+            }
+            let emitter = Emitter(continuation)
+            actor Counter { var value: Int; init(_ v: Int){ value = v } ; func dec() -> Int { value -= 1; return value } }
+            let counter = Counter(targets.count)
+
+            // For each container, open log file handles in async tasks
+            for (svc, container) in targets {
+                Task.detached {
+                    do {
+                        let fds = try await container.logs()
+                        if follow {
+                            if fds.indices.contains(0) {
+                                let fh = fds[0]
+                                fh.readabilityHandler = { handle in
+                                    emitter.emit(svc, .stdout, data: handle.availableData)
+                                }
+                            }
+                            if fds.indices.contains(1) {
+                                let fh = fds[1]
+                                fh.readabilityHandler = { handle in
+                                    emitter.emit(svc, .stderr, data: handle.availableData)
+                                }
+                            }
+                        } else {
+                            if fds.indices.contains(0) {
+                                emitter.emit(svc, .stdout, data: fds[0].readDataToEndOfFile())
+                            }
+                            if fds.indices.contains(1) {
+                                emitter.emit(svc, .stderr, data: fds[1].readDataToEndOfFile())
+                            }
+                            let left = await counter.dec()
+                            if left == 0 { emitter.finish() }
+                        }
+                    } catch {
+                        emitter.fail(error)
+                        let left = await counter.dec()
+                        if left == 0 && !follow { emitter.finish() }
+                    }
+                }
+            }
         }
     }
 
@@ -879,6 +1364,8 @@ public actor Orchestrator {
         try await up(project: project, services: services, progressHandler: progressHandler)
     }
 
+
+
     /// Stop running services
     public func stop(
         project: Project,
@@ -887,7 +1374,7 @@ public actor Orchestrator {
         progressHandler: ProgressUpdateHandler? = nil
     ) async throws {
         // For build functionality, we just call down
-        try await down(project: project, progressHandler: progressHandler)
+        _ = try await down(project: project, progressHandler: progressHandler)
     }
 
     /// Restart services
@@ -897,7 +1384,7 @@ public actor Orchestrator {
         timeout: Int = 10,
         progressHandler: ProgressUpdateHandler? = nil
     ) async throws {
-        try await down(project: project, progressHandler: progressHandler)
+        _ = try await down(project: project, progressHandler: progressHandler)
         try await up(project: project, services: services, progressHandler: progressHandler)
     }
 
@@ -914,8 +1401,32 @@ public actor Orchestrator {
         environment: [String] = [],
         progressHandler: ProgressUpdateHandler? = nil
     ) async throws -> Int32 {
-        // Return success for now - build functionality doesn't need this
-        return 0
+        let containerId = project.services[serviceName]?.containerName ?? "\(project.name)_\(serviceName)"
+        guard let container = try await findRuntimeContainer(byId: containerId) else {
+            throw ContainerizationError(.notFound, message: "Service '\(serviceName)' container not found")
+        }
+
+        // Build process configuration
+        let executable = command.first ?? "/bin/sh"
+        let args = Array(command.dropFirst())
+        var proc = ProcessConfiguration(
+            executable: executable,
+            arguments: args,
+            environment: environment,
+            workingDirectory: workdir ?? "/",
+            terminal: tty
+        )
+        if let user = user { proc.user = .raw(userString: user) }
+
+        // Attach stdio when not detached
+        let stdin: FileHandle? = interactive || tty ? FileHandle.standardInput : nil
+        let stdio: [FileHandle?] = [stdin, FileHandle.standardOutput, FileHandle.standardError]
+
+        let pid = "exec-\(UUID().uuidString)"
+        let process = try await container.createProcess(id: pid, configuration: proc, stdio: stdio)
+        try await process.start()
+        if detach { return 0 }
+        return try await process.wait()
     }
 
     /// Check health of services

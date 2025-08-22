@@ -87,7 +87,7 @@ struct ProjectConverterTests {
         #expect(backendService.name == "backend")
         #expect(backendService.image == nil) // No image specified
         #expect(backendService.build != nil) // Build config should be present
-        #expect(backendService.needsBuild == true) // Should need building
+        #expect(backendService.hasBuild == true) // Should have build configuration
 
         // Test effective image name generation
         let effectiveImage = backendService.effectiveImageName(projectName: "testapp")
@@ -119,7 +119,7 @@ struct ProjectConverterTests {
         let frontendService = try #require(project.services["frontend"])
         #expect(frontendService.image == "node:18-alpine")
         #expect(frontendService.build != nil)
-        #expect(frontendService.needsBuild == false) // Has image, doesn't need building
+        #expect(frontendService.hasBuild == true) // Has build+image; Compose builds and tags to image
 
         // Effective image should be the specified image
         let effectiveImage = frontendService.effectiveImageName(projectName: "testapp")

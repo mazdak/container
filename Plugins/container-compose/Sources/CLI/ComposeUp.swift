@@ -57,7 +57,7 @@ struct ComposeUp: AsyncParsableCommand {
         composeOptions.setEnvironmentVariables()
         
         // Parse compose files
-        let parser = ComposeParser(log: log)
+        let parser = ComposeParser(log: log, allowAnchors: global.allowAnchors)
         let composeFile = try parser.parse(from: composeOptions.getComposeFileURLs())
         
         // Convert to project
@@ -95,7 +95,17 @@ struct ComposeUp: AsyncParsableCommand {
         )
         
         progress.finish()
-        
+
+        // Print final image tags used for services
+        if !project.services.isEmpty {
+            print("Service images:")
+            for (name, svc) in project.services.sorted(by: { $0.key < $1.key }) {
+                let image = svc.effectiveImageName(projectName: project.name)
+                print("- \(name): \(image)")
+            }
+            print("")
+        }
+
         // Call out DNS names for service discovery inside the container network
         if !project.services.isEmpty {
             print("Service DNS names:")

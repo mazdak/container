@@ -61,5 +61,105 @@ struct EnvFileTests {
         #expect(env["D"] == "4")
         #expect(env["QUOTED"] == "x y")
     }
+
+    @Test
+    func testEnvFileSecurityValidation() async throws {
+        let fm = FileManager.default
+        let tempDir = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try fm.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: tempDir) }
+
+        let envPath = tempDir.appendingPathComponent(".env")
+        try "SECRET_KEY=secret123\nAPI_KEY=apikey456".write(to: envPath, atomically: true, encoding: .utf8)
+
+        // Make the file world-readable (insecure)
+        try fm.setAttributes([.posixPermissions: 0o644], ofItemAtPath: envPath.path)
+
+        // Use an actor to safely capture log messages
+        let logCapture = LogCapture()
+        let testLogger = Logger(label: "test") { label in
+            TestLogHandler { message in
+                Task { await logCapture.append(message) }
+            }
+        }
+
+        // Load the .env file
+        let result = EnvLoader.load(from: tempDir, export: false, logger: testLogger)
+
+        // Verify the values were loaded
+        #expect(result["SECRET_KEY"] == "secret123")
+        #expect(result["API_KEY"] == "apikey456")
+
+        // Verify security warning was logged
+        let messages = await logCapture.getMessages()
+        #expect(messages.contains { $0.contains("is readable by group/other") })
+    }
+
+    @Test
+    func testEnvFileSecurePermissions() async throws {
+        let fm = FileManager.default
+        let tempDir = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try fm.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: tempDir) }
+
+        let envPath = tempDir.appendingPathComponent(".env")
+        try "SECURE_VAR=secure_value".write(to: envPath, atomically: true, encoding: .utf8)
+
+        // Make the file secure (owner read/write only)
+        try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: envPath.path)
+
+        // Use an actor to safely capture log messages
+        let logCapture = LogCapture()
+        let testLogger = Logger(label: "test") { label in
+            TestLogHandler { message in
+                Task { await logCapture.append(message) }
+            }
+        }
+
+        // Load the .env file
+        let result = EnvLoader.load(from: tempDir, export: false, logger: testLogger)
+
+        // Verify the value was loaded
+        #expect(result["SECURE_VAR"] == "secure_value")
+
+        // Verify no security warning was logged
+        let messages = await logCapture.getMessages()
+        #expect(!messages.contains { $0.contains("is readable by group/other") })
+    }
+}
+
+// Actor to safely capture log messages
+actor LogCapture {
+    private var messages: [String] = []
+
+    func append(_ message: String) {
+        messages.append(message)
+    }
+
+    func getMessages() -> [String] {
+        return messages
+    }
+}
+
+// Helper for testing log messages
+final class TestLogHandler: LogHandler {
+    let label: String = "test"
+    var logLevel: Logger.Level = .info
+    let capture: @Sendable (String) -> Void
+
+    init(_ capture: @escaping @Sendable (String) -> Void) {
+        self.capture = capture
+    }
+
+    func log(level: Logger.Level, message: Logger.Message, metadata: Logger.Metadata?, source: String, file: String, function: String, line: UInt) {
+        capture(message.description)
+    }
+
+    subscript(metadataKey _: String) -> Logger.Metadata.Value? {
+        get { nil }
+        set {}
+    }
+
+    var metadata: Logger.Metadata = [:]
 }
 
