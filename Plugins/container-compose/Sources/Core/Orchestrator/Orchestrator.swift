@@ -16,10 +16,10 @@
 
 import Foundation
 import ContainerClient
-import ContainerNetworkService
 import Containerization
 import ContainerizationError
 import ContainerizationOS
+import ContainerizationOCI
 import Logging
 
 #if os(macOS)
@@ -482,11 +482,17 @@ public actor Orchestrator {
 
         // Build images for services that need building
         do {
+            log.info("Checking if images need to be built for \(targetServices.count) services")
+            for (name, service) in targetServices {
+                log.info("Service '\(name)': needsBuild=\(service.needsBuild), image=\(service.image ?? "nil"), build=\(service.build != nil ? "present" : "nil")")
+            }
+
             try await buildImagesIfNeeded(
                 project: project,
                 services: targetServices,
                 progressHandler: progressHandler
             )
+            log.info("Image building completed")
         } catch {
             log.error("Failed to build images: \(error)")
             // Clean up any partial state
@@ -499,7 +505,176 @@ public actor Orchestrator {
             projectState[project.name] = ProjectState()
         }
 
+        // Create and start containers for services
+        try await createAndStartContainers(
+            project: project,
+            services: targetServices,
+            detach: detach,
+            forceRecreate: forceRecreate,
+            noRecreate: noRecreate,
+            progressHandler: progressHandler
+        )
+
         log.info("Project '\(project.name)' started successfully")
+    }
+
+    /// Create and start containers for services
+    private func createAndStartContainers(
+        project: Project,
+        services: [String: Service],
+        detach: Bool,
+        forceRecreate: Bool,
+        noRecreate: Bool,
+        progressHandler: ProgressUpdateHandler?
+    ) async throws {
+        // Sort services by dependencies
+        let resolution = try DependencyResolver.resolve(services: services)
+        let sortedServices = resolution.startOrder
+
+        for serviceName in sortedServices {
+            guard let service = services[serviceName] else { continue }
+
+            do {
+                try await createAndStartContainer(
+                    project: project,
+                    serviceName: serviceName,
+                    service: service,
+                    detach: detach,
+                    forceRecreate: forceRecreate,
+                    noRecreate: noRecreate,
+                    progressHandler: progressHandler
+                )
+            } catch {
+                log.error("Failed to start service '\(serviceName)': \(error)")
+                throw error
+            }
+        }
+    }
+
+    /// Create and start a single container for a service
+    private func createAndStartContainer(
+        project: Project,
+        serviceName: String,
+        service: Service,
+        detach: Bool,
+        forceRecreate: Bool,
+        noRecreate: Bool,
+        progressHandler: ProgressUpdateHandler?
+    ) async throws {
+        log.info("Starting service '\(serviceName)' with image '\(service.effectiveImageName(projectName: project.name))', needsBuild: \(service.needsBuild)")
+
+        // Get the effective image name (either original or built)
+        let imageName = service.effectiveImageName(projectName: project.name)
+
+        // Get the default kernel
+        let kernel = try await ClientKernel.getDefaultKernel(for: .current)
+
+        // For services that need building, ensure the image is built first
+        if service.needsBuild {
+            log.info("Service '\(serviceName)' needs building, ensuring image is available")
+            // The image should have been built during buildImagesIfNeeded
+            // Now try to get the actual built image
+            do {
+                _ = try await ClientImage.get(reference: imageName)
+                log.info("Found built image '\(imageName)' for service '\(serviceName)'")
+            } catch {
+                log.error("Built image '\(imageName)' not found for service '\(serviceName)': \(error)")
+                throw ContainerizationError(
+                    .notFound,
+                    message: "Built image '\(imageName)' not found for service '\(serviceName)'. Build may have failed."
+                )
+            }
+        }
+
+        // Create container configuration
+        let containerConfig = try await createContainerConfiguration(
+            project: project,
+            serviceName: serviceName,
+            service: service,
+            imageName: imageName
+        )
+
+        // Create the container
+        let container = try await ClientContainer.create(
+            configuration: containerConfig,
+            kernel: kernel
+        )
+
+        // Store container state
+        projectState[project.name]?.containers[serviceName] = ContainerState(
+            serviceName: serviceName,
+            containerID: container.id,
+            containerName: service.containerName ?? "\(project.name)_\(serviceName)",
+            status: .created
+        )
+
+        // Start the container
+        try await container.initProcess.start()
+
+        // Update container state
+        projectState[project.name]?.containers[serviceName]?.status = .starting
+
+        log.info("Started service '\(serviceName)' with container '\(container.id)'")
+    }
+
+    /// Create container configuration for a service
+    private func createContainerConfiguration(
+        project: Project,
+        serviceName: String,
+        service: Service,
+        imageName: String
+    ) async throws -> ContainerConfiguration {
+        // Resolve the image to get the proper ImageDescription
+        let clientImage = try await ClientImage.get(reference: imageName)
+        let imageDescription = clientImage.description
+
+        // Create process configuration
+        let processConfig = ProcessConfiguration(
+            executable: service.command?.first ?? "/bin/sh",
+            arguments: Array((service.command ?? ["/bin/sh", "-c"]).dropFirst()),
+            environment: service.environment.map { "\($0.key)=\($0.value)" },
+            workingDirectory: service.workingDir ?? "/"
+        )
+
+        // Create container configuration
+        var config = ContainerConfiguration(
+            id: service.containerName ?? "\(project.name)_\(serviceName)",
+            image: imageDescription,
+            process: processConfig
+        )
+
+        // Add labels
+        config.labels = service.labels
+
+        // Add port mappings
+        config.publishedPorts = service.ports.map { port in
+            PublishPort(
+                hostAddress: port.hostIP ?? "0.0.0.0",
+                hostPort: Int(port.hostPort) ?? 0,
+                containerPort: Int(port.containerPort) ?? 0,
+                proto: port.portProtocol == "tcp" ? .tcp : .udp
+            )
+        }
+
+        // Add volume mounts
+        config.mounts = service.volumes.map { volume in
+            Filesystem(
+                type: volume.type == .bind ? .volume(name: "", format: "ext4", cache: .auto, sync: .full) : .volume(name: volume.source, format: "ext4", cache: .auto, sync: .full),
+                source: volume.source,
+                destination: volume.target,
+                options: volume.readOnly ? ["ro"] : []
+            )
+        }
+
+        // Add resource limits
+        if let cpus = service.cpus {
+            config.resources.cpus = Int(cpus) ?? 4
+        }
+        if let memory = service.memory {
+            config.resources.memoryInBytes = UInt64(memory) ?? 1024.mib()
+        }
+
+        return config
     }
 
     /// Build images for services that need building

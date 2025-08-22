@@ -67,7 +67,7 @@ class TestCLICompose: CLITest {
         )
         
         #expect(status != 0)
-        #expect(error.contains("Service 'web' has no image"))
+        #expect(error.contains("Service 'web' must specify either 'image' or 'build'"))
     }
     
     @Test func testComposeUpDown() throws {
