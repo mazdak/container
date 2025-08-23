@@ -317,4 +317,36 @@ class TestCLICompose: CLITest {
             _ = try getContainerStatus("\(projectName)_api")
         } throws: { _ in true }
     }
+
+    @Test func testComposeUpWithRmFlag() throws {
+        let yaml = """
+        version: '3'
+        services:
+          test-service:
+            image: alpine:latest
+            command: ["sh", "-c", "echo 'Hello from test service' && sleep 1"]
+        """
+
+        let composeFile = try createComposeFile(content: yaml)
+        let projectName = "test-rm"
+        defer { try? FileManager.default.removeItem(at: testDir) }
+
+        // Cleanup any leftover containers
+        try? run(arguments: ["compose", "-p", projectName, "-f", composeFile.path, "down"], currentDirectory: testDir)
+
+        // Test compose up with --rm flag
+        let (_, _, upStatus) = try run(
+            arguments: ["compose", "-p", projectName, "-f", composeFile.path, "up", "--rm"],
+            currentDirectory: testDir
+        )
+        #expect(upStatus == 0)
+
+        // Give the container time to exit
+        Thread.sleep(forTimeInterval: 2)
+
+        // Check that the container was automatically removed
+        #expect {
+            _ = try getContainerStatus("\(projectName)_test-service")
+        } throws: { _ in true } // Should throw because container should be removed
+    }
 }

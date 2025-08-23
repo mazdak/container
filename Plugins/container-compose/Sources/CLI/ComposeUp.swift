@@ -47,7 +47,10 @@ struct ComposeUp: AsyncParsableCommand {
     
     @Flag(name: .long, help: "Don't start services after creating them")
     var noDeps: Bool = false
-    
+
+    @Flag(name: .long, help: "Automatically remove containers when they exit")
+    var rm: Bool = false
+
     @Argument(help: "Services to start")
     var services: [String] = []
     
@@ -91,6 +94,7 @@ struct ComposeUp: AsyncParsableCommand {
             noRecreate: noRecreate,
             noDeps: noDeps,
             removeOrphans: removeOrphans,
+            removeOnExit: rm,
             progressHandler: progress.handler
         )
         

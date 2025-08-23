@@ -471,6 +471,7 @@ public actor Orchestrator {
     ///   - detach: Whether to run containers in the background
     ///   - forceRecreate: Force recreation of existing containers
     ///   - noRecreate: Never recreate existing containers
+    ///   - removeOnExit: Automatically remove containers when they exit
     ///   - progressHandler: Optional handler for progress updates
     /// - Throws: `ContainerizationError` if service configuration is invalid or container operations fail
     public func up(
@@ -481,6 +482,7 @@ public actor Orchestrator {
         noRecreate: Bool = false,
         noDeps: Bool = false,
         removeOrphans: Bool = false,
+        removeOnExit: Bool = false,
         progressHandler: ProgressUpdateHandler? = nil
     ) async throws {
         log.info("Starting project '\(project.name)'")
@@ -537,6 +539,7 @@ public actor Orchestrator {
             detach: detach,
             forceRecreate: forceRecreate,
             noRecreate: noRecreate,
+            removeOnExit: removeOnExit,
             progressHandler: progressHandler
         )
 
@@ -594,6 +597,7 @@ public actor Orchestrator {
         detach: Bool,
         forceRecreate: Bool,
         noRecreate: Bool,
+        removeOnExit: Bool,
         progressHandler: ProgressUpdateHandler?
     ) async throws {
         // Sort services by dependencies
@@ -611,6 +615,7 @@ public actor Orchestrator {
                     detach: detach,
                     forceRecreate: forceRecreate,
                     noRecreate: noRecreate,
+                    removeOnExit: removeOnExit,
                     progressHandler: progressHandler
                 )
             } catch {
@@ -628,6 +633,7 @@ public actor Orchestrator {
         detach: Bool,
         forceRecreate: Bool,
         noRecreate: Bool,
+        removeOnExit: Bool,
         progressHandler: ProgressUpdateHandler?
     ) async throws {
         log.info("Starting service '\(serviceName)' with image '\(service.effectiveImageName(projectName: project.name))', hasBuild: \(service.hasBuild)")
@@ -655,6 +661,7 @@ public actor Orchestrator {
             service: service,
             containerId: containerId,
             imageName: imageName,
+            removeOnExit: removeOnExit,
             progressHandler: progressHandler
         )
     }
@@ -751,6 +758,7 @@ public actor Orchestrator {
         service: Service,
         containerId: String,
         imageName: String,
+        removeOnExit: Bool,
         progressHandler: ProgressUpdateHandler?
     ) async throws {
         // Get the default kernel
@@ -761,12 +769,15 @@ public actor Orchestrator {
             project: project,
             serviceName: serviceName,
             service: service,
-            imageName: imageName
+            imageName: imageName,
+            removeOnExit: removeOnExit
         )
 
         // Create the container
+        let createOptions = ContainerCreateOptions(autoRemove: removeOnExit)
         let container = try await ClientContainer.create(
             configuration: containerConfig,
+            options: createOptions,
             kernel: kernel
         )
 
@@ -830,7 +841,8 @@ public actor Orchestrator {
         project: Project,
         serviceName: String,
         service: Service,
-        imageName: String
+        imageName: String,
+        removeOnExit: Bool
     ) async throws -> ContainerConfiguration {
         // Resolve the image to get the proper ImageDescription
         let clientImage = try await ClientImage.get(reference: imageName)

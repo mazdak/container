@@ -111,9 +111,10 @@ Services with unchanged build configurations reuse cached images using a stable 
 ## Commands
 
 - `compose up`:
-  - Builds images as needed, honoring `build:` and `image:`.
-  - Prints service image tags and DNS names.
-  - `--remove-orphans`: removes containers from the same project that are no longer defined (prefers labels; falls back to name prefix).
+   - Builds images as needed, honoring `build:` and `image:`.
+   - Prints service image tags and DNS names.
+   - `--remove-orphans`: removes containers from the same project that are no longer defined (prefers labels; falls back to name prefix).
+   - `--rm`: automatically removes containers when they exit.
 - `compose down`:
   - Stops and removes containers for the project, prints a summary of removed containers and volumes.
   - `--remove-orphans`: also removes any extra containers matching the project.
