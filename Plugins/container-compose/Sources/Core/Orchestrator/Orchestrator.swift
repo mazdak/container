@@ -1469,4 +1469,78 @@ public actor Orchestrator {
         // For testing - simulate waiting for service to start
         try await Task.sleep(nanoseconds: UInt64(deadlineSeconds) * 1_000_000_000)
     }
+
+    /// Result of a remove operation
+    public struct RemoveResult: Sendable {
+        public let removedContainers: [String]
+    }
+
+    /// Remove containers for specified services
+    public func remove(
+        project: Project,
+        services: [String],
+        force: Bool = false,
+        progressHandler: ProgressUpdateHandler? = nil
+    ) async throws -> RemoveResult {
+        log.info("Removing containers for project '\(project.name)'")
+
+        // Determine which containers to remove
+        var targetServices = services
+
+        // If no services specified, remove all services in the project
+        if targetServices.isEmpty {
+            targetServices = Array(project.services.keys)
+        }
+
+        // Get expected container IDs for target services
+        let expectedIds: Set<String> = Set(targetServices.compactMap { serviceName in
+            guard let service = project.services[serviceName] else { return nil }
+            return service.containerName ?? "\(project.name)_\(serviceName)"
+        })
+
+        var removedContainers: [String] = []
+
+        do {
+            let all = try await ClientContainer.list()
+            let targets: [ClientContainer] = all.filter { container in
+                // Check by label first
+                if let proj = container.configuration.labels["com.apple.compose.project"],
+                   proj == project.name,
+                   let svc = container.configuration.labels["com.apple.compose.service"],
+                   targetServices.contains(svc) {
+                    return true
+                }
+                // Fallback to ID matching
+                return expectedIds.contains(container.id)
+            }
+
+            for container in targets {
+                do {
+                    // Check if container is running
+                    if container.status == .running {
+                        if force {
+                            // Force stop and remove
+                            try await container.stop()
+                        } else {
+                            log.warning("Container '\(container.id)' is running, skipping (use -f to force)")
+                            continue
+                        }
+                    }
+
+                    // Remove the container
+                    try await container.delete()
+                    removedContainers.append(container.id)
+                    log.info("Removed container '\(container.id)'")
+
+                } catch {
+                    log.warning("Failed to remove container '\(container.id)': \(error)")
+                }
+            }
+        } catch {
+            log.warning("Failed to enumerate containers: \(error)")
+        }
+
+        log.info("Removed \(removedContainers.count) containers for project '\(project.name)'")
+        return RemoveResult(removedContainers: removedContainers)
+    }
 }

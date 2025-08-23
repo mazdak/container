@@ -47,6 +47,7 @@ struct ComposePlugin: AsyncParsableCommand {
             ComposeExec.self,
             ComposeHealth.self,
             ComposeValidate.self,
+            ComposeRm.self,
         ]
     )
 }
