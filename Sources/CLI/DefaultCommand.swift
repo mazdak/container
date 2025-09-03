@@ -15,6 +15,7 @@
 //===----------------------------------------------------------------------===//
 
 import ArgumentParser
+import Foundation
 import ContainerClient
 import ContainerPlugin
 
@@ -45,8 +46,43 @@ struct DefaultCommand: AsyncParsableCommand {
             throw ValidationError("Unknown option '\(command)'")
         }
 
+        // Compute canonical plugin directories to show in helpful errors (avoid hard-coded paths)
+        let installRoot = CommandLine.executablePathUrl
+            .deletingLastPathComponent()
+            .appendingPathComponent("..")
+            .standardized
+        let userPluginsURL = PluginLoader.userPluginsDir(installRoot: installRoot)
+        let installRootPluginsURL = installRoot
+            .appendingPathComponent("libexec")
+            .appendingPathComponent("container")
+            .appendingPathComponent("plugins")
+            .standardized
+        let hintPaths = [userPluginsURL, installRootPluginsURL]
+            .map { $0.appendingPathComponent(command).path(percentEncoded: false) }
+            .joined(separator: "\n  - ")
+
+        // If plugin loader couldn't be created, the system/APIServer likely isn't running.
+        if pluginLoader == nil {
+            throw ValidationError(
+                """
+                Plugins are unavailable. Start the container system services and retry:
+                  container system start
+
+                If the plugin is installed but still not found, check these locations:
+                  - \(hintPaths)
+                """
+            )
+        }
+
         guard let plugin = pluginLoader?.findPlugin(name: command), plugin.config.isCLI else {
-            throw ValidationError("failed to find plugin named container-\(command)")
+            throw ValidationError(
+                """
+                Plugin 'container-\(command)' not found.
+                - If system services are not running, start them with: container system start
+                - If the plugin isn't installed, ensure it exists under:
+                  - \(hintPaths)
+                """
+            )
         }
         // Exec performs execvp (with no fork).
         try plugin.exec(args: remaining)
