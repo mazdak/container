@@ -15,10 +15,10 @@
 //===----------------------------------------------------------------------===//
 
 import ArgumentParser
-import Foundation
 import ContainerClient
 import ContainerPlugin
 import Darwin
+import Foundation
 
 struct DefaultCommand: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
@@ -53,7 +53,8 @@ struct DefaultCommand: AsyncParsableCommand {
             .appendingPathComponent("..")
             .standardized
         let userPluginsURL = PluginLoader.userPluginsDir(installRoot: installRoot)
-        let installRootPluginsURL = installRoot
+        let installRootPluginsURL =
+            installRoot
             .appendingPathComponent("libexec")
             .appendingPathComponent("container")
             .appendingPathComponent("plugins")
