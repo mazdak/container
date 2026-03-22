@@ -527,6 +527,8 @@ public struct DefaultVolumePopulator: VolumePopulator {
 /// )
 /// ```
 public actor Orchestrator {
+    static let defaultServiceMemoryInBytes: UInt64 = 6144.mib()
+
     public enum PullPolicy: String, Sendable {
         case always
         case missing
@@ -1276,22 +1278,7 @@ public actor Orchestrator {
         if let cpus = service.cpus {
             config.resources.cpus = Int(cpus) ?? 4
         }
-        if let memStr = service.memory, !memStr.isEmpty {
-            do {
-                if memStr.lowercased() == "max" {
-                    // Treat "max" as no override: keep the runtime/default value (set below if needed).
-                    // Intentionally do nothing here.
-                } else {
-                    let res = try Parser.resources(cpus: nil, memory: memStr)
-                    if let bytes = res.memoryInBytes as UInt64? { config.resources.memoryInBytes = bytes }
-                }
-            } catch {
-                log.warning("Invalid memory value '\\(memStr)'; using default. Error: \\(error)")
-            }
-        } else {
-            // Safer default for dev servers (was 1 GiB)
-            config.resources.memoryInBytes = 2048.mib()
-        }
+        config.resources.memoryInBytes = resolvedMemoryLimit(for: service)
 
         labels["com.apple.container.compose.config-hash"] = computeConfigHash(
             project: project,
@@ -1305,6 +1292,27 @@ public actor Orchestrator {
         config.labels = labels
 
         return config
+    }
+
+    func resolvedMemoryLimit(for service: Service) -> UInt64 {
+        guard let memStr = service.memory, !memStr.isEmpty else {
+            return Self.defaultServiceMemoryInBytes
+        }
+
+        do {
+            if memStr.lowercased() == "max" {
+                return Self.defaultServiceMemoryInBytes
+            }
+
+            let res = try Parser.resources(cpus: nil, memory: memStr)
+            if let bytes = res.memoryInBytes as UInt64? {
+                return bytes
+            }
+        } catch {
+            log.warning("Invalid memory value '\\(memStr)'; using default. Error: \\(error)")
+        }
+
+        return Self.defaultServiceMemoryInBytes
     }
 
     private func publishSpec(from port: PortMapping) -> String {
