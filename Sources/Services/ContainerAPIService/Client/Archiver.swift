@@ -43,6 +43,17 @@ public final class Archiver: Sendable {
         }
     }
 
+    private struct ArchiveEntryHashInfo: Encodable {
+        let pathOnHost: URL
+        let pathInArchive: URL
+        let owner: UInt32?
+        let group: UInt32?
+        let permissions: UInt16?
+        let fileType: String
+        let symlinkTarget: String?
+        let size: Int64?
+    }
+
     public static func compress(
         source: URL,
         destination: URL,
@@ -96,7 +107,17 @@ public final class Archiver: Sendable {
                 guard let entry = try Self._createEntry(entryInfo: info) else {
                     throw Error.failedToCreateEntry
                 }
-                hasher.update(data: try encoder.encode(info))
+                let hashInfo = ArchiveEntryHashInfo(
+                    pathOnHost: info.pathOnHost,
+                    pathInArchive: info.pathInArchive,
+                    owner: info.owner,
+                    group: info.group,
+                    permissions: info.permissions,
+                    fileType: entry.fileType.rawValue,
+                    symlinkTarget: entry.symlinkTarget,
+                    size: entry.size
+                )
+                hasher.update(data: try encoder.encode(hashInfo))
                 try Self._compressFile(item: info.pathOnHost, entry: entry, archiver: archiver, hasher: &hasher)
             }
             try archiver.finishEncoding()

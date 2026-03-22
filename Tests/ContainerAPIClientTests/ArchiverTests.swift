@@ -98,4 +98,52 @@ struct ArchiverTests {
         #expect(values.isSymbolicLink == true)
         #expect(try fileManager.destinationOfSymbolicLink(atPath: extractedLinkURL.path) == externalTargetURL.path)
     }
+
+    @Test
+    func testCompressDigestChangesWhenSymlinkTargetChanges() throws {
+        let fileManager = FileManager.default
+        let tempURL = try fileManager.url(
+            for: .itemReplacementDirectory,
+            in: .userDomainMask,
+            appropriateFor: .temporaryDirectory,
+            create: true
+        )
+        defer { try? fileManager.removeItem(at: tempURL) }
+
+        let sourceURL = tempURL.appendingPathComponent("source")
+        try fileManager.createDirectory(at: sourceURL, withIntermediateDirectories: true)
+
+        let firstTargetURL = sourceURL.appendingPathComponent("first.txt")
+        let secondTargetURL = sourceURL.appendingPathComponent("second.txt")
+        try #require("first".data(using: .utf8)).write(to: firstTargetURL)
+        try #require("second".data(using: .utf8)).write(to: secondTargetURL)
+
+        let linkURL = sourceURL.appendingPathComponent("link.txt")
+        try fileManager.createSymbolicLink(atPath: linkURL.path, withDestinationPath: "first.txt")
+
+        let firstArchiveURL = tempURL.appendingPathComponent("first.tar.gz")
+        let firstDigest = try archiveDigest(sourceURL: sourceURL, destinationURL: firstArchiveURL)
+
+        try fileManager.removeItem(at: linkURL)
+        try fileManager.createSymbolicLink(atPath: linkURL.path, withDestinationPath: "second.txt")
+
+        let secondArchiveURL = tempURL.appendingPathComponent("second.tar.gz")
+        let secondDigest = try archiveDigest(sourceURL: sourceURL, destinationURL: secondArchiveURL)
+
+        #expect(firstDigest != secondDigest)
+    }
+
+    private func archiveDigest(sourceURL: URL, destinationURL: URL) throws -> String {
+        let digest = try Archiver.compress(source: sourceURL, destination: destinationURL) { url in
+            let sourcePath = sourceURL.standardizedFileURL.path
+            let path = url.standardizedFileURL.path
+            let relativePath = String(path.dropFirst(sourcePath.count + 1))
+            return Archiver.ArchiveEntryInfo(
+                pathOnHost: url,
+                pathInArchive: URL(fileURLWithPath: relativePath)
+            )
+        }
+
+        return digest.compactMap { String(format: "%02x", $0) }.joined()
+    }
 }
