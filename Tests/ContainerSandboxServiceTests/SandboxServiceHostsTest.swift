@@ -16,7 +16,7 @@
 
 import Testing
 
-@testable import ContainerClient
+@testable import ContainerResource
 @testable import ContainerSandboxService
 
 struct SandboxServiceHostsTest {

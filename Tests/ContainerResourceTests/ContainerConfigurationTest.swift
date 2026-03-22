@@ -18,7 +18,7 @@ import Foundation
 import Testing
 import ContainerizationOCI
 
-@testable import ContainerClient
+@testable import ContainerResource
 
 struct ContainerConfigurationTest {
     @Test
