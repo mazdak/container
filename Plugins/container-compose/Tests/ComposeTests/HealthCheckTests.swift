@@ -246,7 +246,7 @@ private final class FakeClientProcess: @unchecked Sendable, ClientProcess {
         case .exit(let code):
             return code
         case .sleep(let seconds):
-            try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+            try await Task.sleep(for: .seconds(seconds))
             return 0
         }
     }
