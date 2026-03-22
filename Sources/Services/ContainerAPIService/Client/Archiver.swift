@@ -353,7 +353,9 @@ public final class Archiver: Sendable {
             return symlinkTarget
         }
 
-        let targetPath = URL(fileURLWithPath: symlinkTarget).standardizedFileURL
+        let targetPath = URL(fileURLWithPath: symlinkTarget)
+            .standardizedFileURL
+            .resolvingSymlinksInPath()
         guard let targetArchivePaths = archivedPathsByHostPath[targetPath], targetArchivePaths.count == 1, let targetArchivePath = targetArchivePaths.first else {
             return symlinkTarget
         }
