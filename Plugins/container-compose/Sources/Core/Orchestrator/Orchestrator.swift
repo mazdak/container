@@ -529,6 +529,12 @@ public struct DefaultVolumePopulator: VolumePopulator {
 public actor Orchestrator {
     static let defaultServiceMemoryInBytes: UInt64 = 6144.mib()
 
+    enum ExistingContainerAction: Equatable {
+        case create
+        case reuse
+        case recreate
+    }
+
     public enum PullPolicy: String, Sendable {
         case always
         case missing
@@ -952,7 +958,7 @@ public actor Orchestrator {
         let containerId = service.containerName ?? "\(project.name)_\(serviceName)"
 
         // Handle existing container logic
-        try await handleExistingContainer(
+        let existingContainerAction = try await handleExistingContainer(
             project: project,
             serviceName: serviceName,
             service: service,
@@ -960,6 +966,10 @@ public actor Orchestrator {
             forceRecreate: forceRecreate,
             noRecreate: noRecreate
         )
+
+        if existingContainerAction == .reuse {
+            return
+        }
 
         // Ensure image is available for build services
         let imageName = service.effectiveImageName(projectName: project.name)
@@ -985,23 +995,20 @@ public actor Orchestrator {
         containerId: String,
         forceRecreate: Bool,
         noRecreate: Bool
-    ) async throws {
+    ) async throws -> ExistingContainerAction {
         guard let existing = try? await findRuntimeContainer(byId: containerId) else {
-            return // No existing container, proceed with creation
+            return .create
         }
 
-        if noRecreate {
+        if Self.existingContainerAction(
+            forceRecreate: forceRecreate,
+            noRecreate: noRecreate,
+            currentHash: nil,
+            expectedHash: nil
+        ) == .reuse {
             log.info("Reusing existing container '\(existing.id)' for service '\(serviceName)' (no-recreate)")
-            // Track in state if missing
-            if projectState[project.name]?.containers[serviceName] == nil {
-                projectState[project.name]?.containers[serviceName] = ContainerState(
-                    serviceName: serviceName,
-                    containerID: existing.id,
-                    containerName: containerId,
-                    status: .starting
-                )
-            }
-            return
+            storeReusedContainerState(project: project, serviceName: serviceName, existing: existing, containerId: containerId)
+            return .reuse
         }
 
         if !forceRecreate {
@@ -1033,9 +1040,15 @@ public actor Orchestrator {
                 }
             )
             let currentHash = existing.configuration.labels["com.apple.container.compose.config-hash"]
-            if currentHash == expectedHash {
+            if Self.existingContainerAction(
+                forceRecreate: forceRecreate,
+                noRecreate: noRecreate,
+                currentHash: currentHash,
+                expectedHash: expectedHash
+            ) == .reuse {
                 log.info("Reusing existing container '\(existing.id)' for service '\(serviceName)' (config unchanged)")
-                return
+                storeReusedContainerState(project: project, serviceName: serviceName, existing: existing, containerId: containerId)
+                return .reuse
             }
         }
 
@@ -1061,6 +1074,38 @@ public actor Orchestrator {
             do { try await containerClient.delete(id: existing.id, force: true) } catch { log.warning("forced delete attempt failed for \(existing.id): \(error)") }
         }
         projectState[project.name]?.containers.removeValue(forKey: serviceName)
+        return .recreate
+    }
+
+    private func storeReusedContainerState(
+        project: Project,
+        serviceName: String,
+        existing: ContainerSnapshot,
+        containerId: String
+    ) {
+        if projectState[project.name]?.containers[serviceName] == nil {
+            projectState[project.name]?.containers[serviceName] = ContainerState(
+                serviceName: serviceName,
+                containerID: existing.id,
+                containerName: containerId,
+                status: .starting
+            )
+        }
+    }
+
+    nonisolated static func existingContainerAction(
+        forceRecreate: Bool,
+        noRecreate: Bool,
+        currentHash: String?,
+        expectedHash: String?
+    ) -> ExistingContainerAction {
+        if noRecreate {
+            return .reuse
+        }
+        if !forceRecreate, let currentHash, let expectedHash, currentHash == expectedHash {
+            return .reuse
+        }
+        return currentHash == nil && expectedHash == nil ? .create : .recreate
     }
 
     /// Ensure the image is available for services that need building

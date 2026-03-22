@@ -185,6 +185,42 @@ struct OrchestratorBuildTests {
     }
 
     @Test
+    func testExistingContainerActionReusesForNoRecreate() {
+        #expect(
+            Orchestrator.existingContainerAction(
+                forceRecreate: false,
+                noRecreate: true,
+                currentHash: nil,
+                expectedHash: nil
+            ) == .reuse
+        )
+    }
+
+    @Test
+    func testExistingContainerActionReusesForMatchingHashes() {
+        #expect(
+            Orchestrator.existingContainerAction(
+                forceRecreate: false,
+                noRecreate: false,
+                currentHash: "abc",
+                expectedHash: "abc"
+            ) == .reuse
+        )
+    }
+
+    @Test
+    func testExistingContainerActionRecreatesWhenConfigChanged() {
+        #expect(
+            Orchestrator.existingContainerAction(
+                forceRecreate: false,
+                noRecreate: false,
+                currentHash: "abc",
+                expectedHash: "def"
+            ) == .recreate
+        )
+    }
+
+    @Test
     func testOrchestratorCleanupFunctionality() async throws {
         // Test that the orchestrator can be created and basic functionality works
         _ = Orchestrator(log: log)
