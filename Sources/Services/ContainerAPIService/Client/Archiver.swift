@@ -197,6 +197,13 @@ public final class Archiver: Sendable {
 
     // MARK: private functions
     private static func _compressFile(item: URL, entry: WriteEntry, archiver: ArchiveWriter, hasher: inout SHA256) throws {
+        guard entry.fileType == .regular else {
+            let writer = archiver.makeTransactionWriter()
+            try writer.writeHeader(entry: entry)
+            try writer.finish()
+            return
+        }
+
         guard let stream = InputStream(url: item) else {
             return
         }
@@ -235,10 +242,12 @@ public final class Archiver: Sendable {
                 return nil
             case .typeDirectory:
                 entry.fileType = .directory
+                entry.size = 0
             case .typeRegular:
                 entry.fileType = .regular
             case .typeSymbolicLink:
                 entry.fileType = .symbolicLink
+                entry.size = 0
                 let symlinkTarget = try fileManager.destinationOfSymbolicLink(atPath: entryInfo.pathOnHost.path)
                 entry.symlinkTarget = symlinkTarget
             default:
@@ -252,7 +261,7 @@ public final class Archiver: Sendable {
             entry.permissions = posixPermissions.uint32Value
             #endif
         }
-        if let fileSize = attributes[.size] as? UInt64 {
+        if entry.fileType == .regular, let fileSize = attributes[.size] as? UInt64 {
             entry.size = Int64(fileSize)
         }
         if let uid = attributes[.ownerAccountID] as? NSNumber {
