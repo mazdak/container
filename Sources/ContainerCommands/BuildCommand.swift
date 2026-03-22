@@ -246,19 +246,25 @@ extension Application {
                     buildFileData = try Data(contentsOf: URL(filePath: tempFile.path()))
                 } else {
                     let ignoreFileURL = URL(filePath: dockerfile + ".dockerignore")
+                    let rootIgnoreFileURL = URL(fileURLWithPath: contextDir).appendingPathComponent(".dockerignore")
                     buildFileData = try Data(contentsOf: URL(filePath: dockerfile))
                     ignoreFileData = try? Data(contentsOf: ignoreFileURL)
-
-                    if var ignoreFileData {
-                        hiddenDockerDir = Self.hiddenDockerDir
-                        let hiddenDirInContext = URL(fileURLWithPath: contextDir).appendingPathComponent(Self.hiddenDockerDir)
-
-                        try FileManager.default.createDirectory(at: hiddenDirInContext, withIntermediateDirectories: true)
-                        try buildFileData.write(to: hiddenDirInContext.appendingPathComponent("Dockerfile"))
-
-                        ignoreFileData.append("\n\(Self.hiddenDockerDir)".data(using: .utf8) ?? Data())
-                        try ignoreFileData.write(to: hiddenDirInContext.appendingPathComponent("Dockerfile.dockerignore"))
+                    if ignoreFileData == nil {
+                        ignoreFileData = try? Data(contentsOf: rootIgnoreFileURL)
                     }
+
+                    hiddenDockerDir = Self.hiddenDockerDir
+                    let hiddenDirInContext = URL(fileURLWithPath: contextDir).appendingPathComponent(Self.hiddenDockerDir)
+
+                    try FileManager.default.createDirectory(at: hiddenDirInContext, withIntermediateDirectories: true)
+                    try buildFileData.write(to: hiddenDirInContext.appendingPathComponent("Dockerfile"))
+
+                    var stagedIgnoreFileData = ignoreFileData ?? Data()
+                    if !stagedIgnoreFileData.isEmpty, stagedIgnoreFileData.last != 0x0A {
+                        stagedIgnoreFileData.append(0x0A)
+                    }
+                    stagedIgnoreFileData.append("\(Self.hiddenDockerDir)\n".data(using: .utf8) ?? Data())
+                    try stagedIgnoreFileData.write(to: hiddenDirInContext.appendingPathComponent("Dockerfile.dockerignore"))
                 }
 
                 defer {
