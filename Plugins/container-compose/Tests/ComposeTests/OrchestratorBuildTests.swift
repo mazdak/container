@@ -165,6 +165,26 @@ struct OrchestratorBuildTests {
     }
 
     @Test
+    func testResolvedMemoryLimitDefaultsToSixGiBWhenUnspecified() async throws {
+        let orchestrator = Orchestrator(log: log)
+        let service = Service(name: "frontend", image: "resq-fullstack:dev")
+
+        let memory = await orchestrator.resolvedMemoryLimit(for: service)
+
+        #expect(memory == 6144.mib())
+    }
+
+    @Test
+    func testResolvedMemoryLimitUsesExplicitComposeValue() async throws {
+        let orchestrator = Orchestrator(log: log)
+        let service = Service(name: "frontend", image: "resq-fullstack:dev", memory: "2g")
+
+        let memory = await orchestrator.resolvedMemoryLimit(for: service)
+
+        #expect(memory == 2048.mib())
+    }
+
+    @Test
     func testOrchestratorCleanupFunctionality() async throws {
         // Test that the orchestrator can be created and basic functionality works
         _ = Orchestrator(log: log)
