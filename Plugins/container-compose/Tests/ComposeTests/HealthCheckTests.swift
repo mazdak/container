@@ -19,6 +19,8 @@ import ComposeCore
 import ContainerizationError
 import Logging
 import Foundation
+import ContainerAPIClient
+import ContainerizationOS
 @testable import ComposeCore
 
 struct HealthCheckTests {
@@ -185,5 +187,67 @@ struct HealthCheckTests {
         let project = try converter.convert(composeFile: composeFile, projectName: "test")
         let hc = try #require(project.services["api"]?.healthCheck)
         #expect(hc.test == ["/bin/sh", "-c", "echo ok"])
+    }
+
+    @Test
+    func testHealthCheckWaitForExitReturnsProcessExitCodeBeforeTimeout() async throws {
+        let process = FakeClientProcess(waitBehavior: .exit(code: 0))
+
+        let result = try await DefaultHealthCheckRunner.waitForExit(process: process, timeout: 1.0)
+
+        #expect(result == 0)
+        #expect(await process.state.killedSignals.isEmpty)
+    }
+
+    @Test
+    func testHealthCheckWaitForExitKillsHungProcessAfterTimeout() async throws {
+        let process = FakeClientProcess(waitBehavior: .sleep(seconds: 30))
+
+        await #expect(throws: DefaultHealthCheckRunner.TimeoutError.self) {
+            _ = try await DefaultHealthCheckRunner.waitForExit(process: process, timeout: 0.01)
+        }
+
+        #expect(await process.state.killedSignals == [SIGKILL])
+    }
+}
+
+private actor FakeProcessState {
+    var killedSignals: [Int32] = []
+
+    func record(signal: Int32) {
+        killedSignals.append(signal)
+    }
+}
+
+private final class FakeClientProcess: @unchecked Sendable, ClientProcess {
+    enum WaitBehavior {
+        case exit(code: Int32)
+        case sleep(seconds: TimeInterval)
+    }
+
+    let id: String = "fake-process"
+    let state = FakeProcessState()
+    private let waitBehavior: WaitBehavior
+
+    init(waitBehavior: WaitBehavior) {
+        self.waitBehavior = waitBehavior
+    }
+
+    func start() async throws {}
+
+    func resize(_ size: Terminal.Size) async throws {}
+
+    func kill(_ signal: Int32) async throws {
+        await state.record(signal: signal)
+    }
+
+    func wait() async throws -> Int32 {
+        switch waitBehavior {
+        case .exit(let code):
+            return code
+        case .sleep(let seconds):
+            try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+            return 0
+        }
     }
 }

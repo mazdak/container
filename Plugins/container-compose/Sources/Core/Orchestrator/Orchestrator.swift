@@ -78,8 +78,8 @@ public struct DefaultHealthCheckRunner: HealthCheckRunner {
             )
             try await process.start()
 
-            // Wait for process completion
-            let result = try await process.wait()
+            // Wait for process completion, enforcing the health-check timeout if configured.
+            let result = try await Self.waitForExit(process: process, timeout: healthCheck.timeout)
 
             // Check exit status
             let success = result == 0
@@ -91,17 +91,98 @@ public struct DefaultHealthCheckRunner: HealthCheckRunner {
 
             return success
 
+        } catch let error as TimeoutError {
+            log.warning("Health check timed out after \(error.duration)s")
+            return false
         } catch {
             log.error("Health check execution failed: \(error.localizedDescription)")
             return false
         }
     }
 
-    private struct TimeoutError: Error {
+    static func waitForExit(process: ClientProcess, timeout: TimeInterval?) async throws -> Int32 {
+        guard let timeout, timeout > 0 else {
+            return try await process.wait()
+        }
+
+        let coordinator = ProcessWaitCoordinator()
+        let waitTask = Task {
+            do {
+                let exitCode = try await process.wait()
+                await coordinator.complete(.success(exitCode))
+            } catch {
+                await coordinator.complete(.failure(error))
+            }
+        }
+
+        do {
+            return try await withThrowingTaskGroup(of: Int32.self) { group in
+                group.addTask {
+                    try await coordinator.wait()
+                }
+                group.addTask {
+                    try await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+                    throw TimeoutError(duration: timeout)
+                }
+
+                let result = try await group.next()!
+                group.cancelAll()
+                return result
+            }
+        } catch let error as TimeoutError {
+            waitTask.cancel()
+            try? await process.kill(SIGKILL)
+            throw error
+        } catch {
+            waitTask.cancel()
+            throw error
+        }
+    }
+
+    struct TimeoutError: Error {
         let duration: TimeInterval
     }
 
+    private actor ProcessWaitCoordinator {
+        private var result: Result<Int32, Error>?
+        private var waiters: [UUID: CheckedContinuation<Int32, Error>] = [:]
 
+        func wait() async throws -> Int32 {
+            if let result {
+                return try result.get()
+            }
+
+            let waiterID = UUID()
+            return try await withTaskCancellationHandler {
+                try await withCheckedThrowingContinuation { continuation in
+                    waiters[waiterID] = continuation
+                }
+            } onCancel: {
+                Task { await self.cancel(waiterID: waiterID) }
+            }
+        }
+
+        func complete(_ result: Result<Int32, Error>) {
+            guard self.result == nil else { return }
+            self.result = result
+
+            let continuations = Array(waiters.values)
+            waiters.removeAll()
+            for continuation in continuations {
+                switch result {
+                case .success(let value):
+                    continuation.resume(returning: value)
+                case .failure(let error):
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+
+        private func cancel(waiterID: UUID) {
+            guard let continuation = waiters.removeValue(forKey: waiterID) else { return }
+            continuation.resume(throwing: CancellationError())
+        }
+    }
 }
 
 // MARK: - BuildService
