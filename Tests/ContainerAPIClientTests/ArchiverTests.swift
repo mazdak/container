@@ -100,6 +100,46 @@ struct ArchiverTests {
     }
 
     @Test
+    func testCompressAndUncompressRewritesArchivedAbsoluteSymbolicLinkTarget() throws {
+        let fileManager = FileManager.default
+        let tempURL = try fileManager.url(
+            for: .itemReplacementDirectory,
+            in: .userDomainMask,
+            appropriateFor: .temporaryDirectory,
+            create: true
+        )
+        defer { try? fileManager.removeItem(at: tempURL) }
+
+        let sourceURL = tempURL.appendingPathComponent("source")
+        let archiveURL = tempURL.appendingPathComponent("archive.tar.gz")
+        let destinationURL = tempURL.appendingPathComponent("destination")
+        try fileManager.createDirectory(at: sourceURL, withIntermediateDirectories: true)
+
+        let targetURL = sourceURL.appendingPathComponent("target.txt")
+        try #require("hello".data(using: .utf8)).write(to: targetURL)
+        let linkURL = sourceURL.appendingPathComponent("link.txt")
+        try fileManager.createSymbolicLink(atPath: linkURL.path, withDestinationPath: targetURL.path)
+
+        _ = try Archiver.compress(source: sourceURL, destination: archiveURL) { url in
+            let sourcePath = sourceURL.standardizedFileURL.path
+            let path = url.standardizedFileURL.path
+            let relativePath = String(path.dropFirst(sourcePath.count + 1))
+            return Archiver.ArchiveEntryInfo(
+                pathOnHost: url,
+                pathInArchive: URL(fileURLWithPath: relativePath)
+            )
+        }
+
+        try Archiver.uncompress(source: archiveURL, destination: destinationURL)
+
+        let extractedLinkURL = destinationURL.appendingPathComponent("link.txt")
+        let values = try extractedLinkURL.resourceValues(forKeys: [.isSymbolicLinkKey])
+        #expect(values.isSymbolicLink == true)
+        #expect(try fileManager.destinationOfSymbolicLink(atPath: extractedLinkURL.path) == "target.txt")
+        #expect(try String(contentsOf: extractedLinkURL, encoding: .utf8) == "hello")
+    }
+
+    @Test
     func testCompressDigestChangesWhenSymlinkTargetChanges() throws {
         let fileManager = FileManager.default
         let tempURL = try fileManager.url(
