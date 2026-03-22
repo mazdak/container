@@ -59,11 +59,6 @@ public struct ProjectConverter {
             }
         }
         
-        // Add default network if no networks specified
-        if networks.isEmpty {
-            networks["default"] = Network(name: "default", driver: "bridge", external: false)
-        }
-        
         // Convert volumes
         var volumes: [String: Volume] = [:]
         if let composeVolumes = composeFile.volumes {
@@ -408,7 +403,7 @@ public struct ProjectConverter {
             case .dict(let dict):
                 return Array(dict.keys)
             case nil:
-                return ["default"]
+                return []
             }
         }()
         

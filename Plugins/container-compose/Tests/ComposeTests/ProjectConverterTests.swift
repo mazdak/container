@@ -305,4 +305,24 @@ struct ProjectConverterTests {
         )
         #expect(project.services["web"] != nil)
     }
+
+    @Test
+    func testConvertDoesNotSynthesizeProjectNetworkWhenComposeOmitsNetworks() throws {
+        let yaml = """
+        version: '3'
+        services:
+          web:
+            image: alpine
+        """
+
+        let parser = ComposeParser(log: log)
+        let composeFile = try parser.parse(from: yaml.data(using: .utf8)!)
+        let project = try ProjectConverter(log: log).convert(
+            composeFile: composeFile,
+            projectName: "demo"
+        )
+
+        #expect(project.networks.isEmpty)
+        #expect(project.services["web"]?.networks.isEmpty == true)
+    }
 }
