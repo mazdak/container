@@ -1815,9 +1815,13 @@ public actor Orchestrator {
 
         let gatewayAddress = try await resolveHostGatewayAddress(primaryNetworkId: primaryNetworkId)
         return extraHosts.map { host in
-            let address = host.address == "host-gateway" ? gatewayAddress : host.address
+            let address = resolvedComposeHostAddress(host.address, gatewayAddress: gatewayAddress)
             return ContainerConfiguration.HostEntry(ipAddress: address, hostnames: [host.hostname])
         }
+    }
+
+    nonisolated internal func resolvedComposeHostAddress(_ address: String, gatewayAddress: String) -> String {
+        address == "host-gateway" ? gatewayAddress : address
     }
 
     internal func resolveHostGatewayAddress(primaryNetworkId: String?) async throws -> String {

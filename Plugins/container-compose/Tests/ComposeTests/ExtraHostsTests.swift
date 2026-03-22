@@ -99,4 +99,13 @@ struct ExtraHostsTests {
             "db=192.168.64.2",
         ]))
     }
+
+    @Test
+    func testResolvedComposeHostAddressMapsHostGatewaySentinel() throws {
+        let orchestrator = Orchestrator(log: Logger(label: "test"))
+
+        let gateway = "192.168.64.1"
+        #expect(orchestrator.resolvedComposeHostAddress("host-gateway", gatewayAddress: gateway) == gateway)
+        #expect(orchestrator.resolvedComposeHostAddress("192.168.64.2", gatewayAddress: gateway) == "192.168.64.2")
+    }
 }
