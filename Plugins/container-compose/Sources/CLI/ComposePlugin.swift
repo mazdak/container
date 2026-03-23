@@ -47,6 +47,7 @@ struct ComposePlugin: AsyncParsableCommand {
         commandName: "compose",
         abstract: "Manage multi-container applications",
         subcommands: [
+            ComposeConfig.self,
             ComposeBuild.self,
             ComposeRun.self,
             ComposeUp.self,
@@ -81,7 +82,7 @@ struct ComposePlugin: AsyncParsableCommand {
 
 enum ComposeArgumentNormalizer {
     static let subcommands: Set<String> = [
-        "build", "run", "up", "down", "ps", "start", "stop", "restart", "logs", "exec", "health", "validate", "rm",
+        "config", "build", "run", "up", "down", "ps", "start", "stop", "restart", "logs", "exec", "health", "validate", "rm",
     ]
 
     private static let rootFlags: [String: String] = [

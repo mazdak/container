@@ -30,10 +30,113 @@ struct ComposeCLITests {
         #expect(result.status == 0)
         #expect(result.stdout.contains("Manage multi-container applications"))
         #expect(result.stdout.contains("build"))
+        #expect(result.stdout.contains("config"))
         #expect(result.stdout.contains("run"))
         #expect(result.stdout.contains("up"))
         #expect(result.stdout.contains("health"))
         #expect(result.stdout.contains("validate"))
+    }
+
+    @Test
+    func testConfigPrintsResolvedYaml() throws {
+        let dir = try ComposeCLITestSupport.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let composeURL = dir.appendingPathComponent("docker-compose.yml")
+        try """
+        name: demo
+        services:
+          web:
+            image: ${IMAGE_NAME}
+            profiles: [worktree]
+          redis:
+            image: redis:7-alpine
+        """.write(to: composeURL, atomically: true, encoding: .utf8)
+        try "IMAGE_NAME=nginx:alpine\n".write(to: dir.appendingPathComponent(".env"), atomically: true, encoding: .utf8)
+
+        let result = try ComposeCLITestSupport.run(
+            arguments: ["config", "-f", composeURL.path, "--profile", "worktree"],
+            currentDirectory: dir
+        )
+
+        #expect(result.status == 0)
+        #expect(result.stdout.contains("name: demo"))
+        #expect(result.stdout.contains("image: nginx:alpine"))
+        #expect(result.stdout.contains("web:"))
+        #expect(result.stdout.contains("redis:"))
+    }
+
+    @Test
+    func testConfigSupportsJsonFormat() throws {
+        let dir = try ComposeCLITestSupport.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let composeURL = dir.appendingPathComponent("docker-compose.yml")
+        try """
+        services:
+          app:
+            image: nginx:alpine
+        """.write(to: composeURL, atomically: true, encoding: .utf8)
+
+        let result = try ComposeCLITestSupport.run(
+            arguments: ["config", "-f", composeURL.path, "--format", "json"],
+            currentDirectory: dir
+        )
+
+        #expect(result.status == 0)
+        #expect(result.stdout.contains("\"services\""))
+        #expect(result.stdout.contains("\"app\""))
+        #expect(result.stdout.contains("\"nginx:alpine\""))
+    }
+
+    @Test
+    func testConfigServicesListsFilteredServices() throws {
+        let dir = try ComposeCLITestSupport.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let composeURL = dir.appendingPathComponent("docker-compose.yml")
+        try """
+        services:
+          web:
+            image: nginx:alpine
+          worker:
+            image: busybox:latest
+            profiles: [jobs]
+        """.write(to: composeURL, atomically: true, encoding: .utf8)
+
+        let result = try ComposeCLITestSupport.run(
+            arguments: ["config", "-f", composeURL.path, "--services", "--profile", "jobs"],
+            currentDirectory: dir
+        )
+
+        #expect(result.status == 0)
+        #expect(result.stdout.contains("web"))
+        #expect(result.stdout.contains("worker"))
+    }
+
+    @Test
+    func testConfigSelectedServiceIncludesExplicitlyProfiledService() throws {
+        let dir = try ComposeCLITestSupport.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let composeURL = dir.appendingPathComponent("docker-compose.yml")
+        try """
+        services:
+          web:
+            image: nginx:alpine
+            profiles: [jobs]
+          redis:
+            image: redis:7-alpine
+        """.write(to: composeURL, atomically: true, encoding: .utf8)
+
+        let result = try ComposeCLITestSupport.run(
+            arguments: ["config", "-f", composeURL.path, "web"],
+            currentDirectory: dir
+        )
+
+        #expect(result.status == 0)
+        #expect(result.stdout.contains("web:"))
+        #expect(!result.stdout.contains("redis:"))
     }
 
     @Test
