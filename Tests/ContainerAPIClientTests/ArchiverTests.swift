@@ -173,6 +173,43 @@ struct ArchiverTests {
         #expect(firstDigest != secondDigest)
     }
 
+    @Test
+    func testCompressEntriesOnlyArchivesExplicitInputs() throws {
+        let fileManager = FileManager.default
+        let tempURL = try fileManager.url(
+            for: .itemReplacementDirectory,
+            in: .userDomainMask,
+            appropriateFor: .temporaryDirectory,
+            create: true
+        )
+        defer { try? fileManager.removeItem(at: tempURL) }
+
+        let sourceURL = tempURL.appendingPathComponent("source")
+        let archiveURL = tempURL.appendingPathComponent("archive.tar.gz")
+        let destinationURL = tempURL.appendingPathComponent("destination")
+        try fileManager.createDirectory(at: sourceURL, withIntermediateDirectories: true)
+
+        let includeURL = sourceURL.appendingPathComponent("include.txt")
+        let excludeURL = sourceURL.appendingPathComponent("exclude.txt")
+        try #require("keep".data(using: .utf8)).write(to: includeURL)
+        try #require("drop".data(using: .utf8)).write(to: excludeURL)
+
+        _ = try Archiver.compress(
+            entries: [
+                Archiver.ArchiveEntryInfo(
+                    pathOnHost: includeURL,
+                    pathInArchive: URL(fileURLWithPath: "include.txt")
+                )
+            ],
+            destination: archiveURL
+        )
+
+        try Archiver.uncompress(source: archiveURL, destination: destinationURL)
+
+        #expect(fileManager.fileExists(atPath: destinationURL.appendingPathComponent("include.txt").path))
+        #expect(!fileManager.fileExists(atPath: destinationURL.appendingPathComponent("exclude.txt").path))
+    }
+
     private func archiveDigest(sourceURL: URL, destinationURL: URL) throws -> String {
         let digest = try Archiver.compress(source: sourceURL, destination: destinationURL) { url in
             let sourcePath = sourceURL.standardizedFileURL.path
