@@ -74,6 +74,7 @@ public struct ComposeService: Codable {
     public let volumes: [ServiceVolume]?
     public let ports: [String]?
     public let networks: NetworkConfig?
+    public let networkMode: String?
     public let dependsOn: DependsOn?
     public let deploy: DeployConfig?
     public let memLimit: String?
@@ -95,6 +96,7 @@ public struct ComposeService: Codable {
         case environment
         case envFile = "env_file"
         case volumes, ports, networks
+        case networkMode = "network_mode"
         case dependsOn = "depends_on"
         case deploy
         case memLimit = "mem_limit"
@@ -117,6 +119,7 @@ public struct ComposeService: Codable {
         volumes: [ServiceVolume]? = nil,
         ports: [String]? = nil,
         networks: NetworkConfig? = nil,
+        networkMode: String? = nil,
         dependsOn: DependsOn? = nil,
         deploy: DeployConfig? = nil,
         memLimit: String? = nil,
@@ -142,6 +145,7 @@ public struct ComposeService: Codable {
         self.volumes = volumes
         self.ports = ports
         self.networks = networks
+        self.networkMode = networkMode
         self.dependsOn = dependsOn
         self.deploy = deploy
         self.memLimit = memLimit

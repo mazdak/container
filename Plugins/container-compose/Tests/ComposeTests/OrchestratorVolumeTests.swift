@@ -163,4 +163,27 @@ struct OrchestratorVolumeTests {
         #expect(isDirectory.boolValue)
         #expect(await fakePopulator.snapshotCalls().isEmpty)
     }
+
+    @Test
+    func testResolveComposeMountsSkipsCopyUpForExistingVolume() async throws {
+        let fakeClient = FakeVolumeClient()
+        let fakePopulator = FakeVolumePopulator()
+        _ = try await fakeClient.create(name: "namedvol", driver: "local", driverOpts: [:], labels: [:])
+
+        let orch = Orchestrator(log: log, volumeClient: fakeClient, volumePopulator: fakePopulator)
+        let mounts = [
+            VolumeMount(source: "namedvol", target: "/var/lib/data", type: .volume)
+        ]
+        let service = Service(name: "app", image: "alpine:latest", volumes: mounts)
+        let project = Project(name: "proj", services: ["app": service], networks: [:], volumes: ["namedvol": Volume(name: "namedvol")])
+
+        _ = try await orch.resolveComposeMounts(
+            project: project,
+            serviceName: "app",
+            imageName: "alpine:latest",
+            mounts: mounts
+        )
+
+        #expect(await fakePopulator.snapshotCalls().isEmpty)
+    }
 }

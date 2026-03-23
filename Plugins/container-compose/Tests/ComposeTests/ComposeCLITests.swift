@@ -29,6 +29,8 @@ struct ComposeCLITests {
         let result = try ComposeCLITestSupport.run(arguments: ["--help"], currentDirectory: dir)
         #expect(result.status == 0)
         #expect(result.stdout.contains("Manage multi-container applications"))
+        #expect(result.stdout.contains("build"))
+        #expect(result.stdout.contains("run"))
         #expect(result.stdout.contains("up"))
         #expect(result.stdout.contains("health"))
         #expect(result.stdout.contains("validate"))
@@ -72,6 +74,45 @@ struct ComposeCLITests {
     }
 
     @Test
+    func testValidateSupportsDockerStyleRootFileOption() throws {
+        let dir = try ComposeCLITestSupport.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let composeURL = dir.appendingPathComponent("docker-compose.yml")
+        try """
+        services:
+          web:
+            image: nginx:alpine
+        """.write(to: composeURL, atomically: true, encoding: .utf8)
+
+        let result = try ComposeCLITestSupport.run(arguments: ["-f", composeURL.path, "validate", "--quiet"], currentDirectory: dir)
+        #expect(result.status == 0)
+    }
+
+    @Test
+    func testValidateSupportsExplicitEnvFileFromRootOptions() throws {
+        let dir = try ComposeCLITestSupport.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let composeURL = dir.appendingPathComponent("docker-compose.yml")
+        let envURL = dir.appendingPathComponent("custom.env")
+        try """
+        services:
+          web:
+            image: ${IMAGE_NAME}
+        """.write(to: composeURL, atomically: true, encoding: .utf8)
+        try "IMAGE_NAME=nginx:alpine\n".write(to: envURL, atomically: true, encoding: .utf8)
+
+        let result = try ComposeCLITestSupport.run(
+            arguments: ["--env-file", envURL.path, "-f", composeURL.path, "validate"],
+            currentDirectory: dir
+        )
+
+        #expect(result.status == 0)
+        #expect(result.stdout.contains("Image: nginx:alpine"))
+    }
+
+    @Test
     func testUpEarlyExitForUnmatchedProfiles() throws {
         let dir = try ComposeCLITestSupport.makeTempDir()
         defer { try? FileManager.default.removeItem(at: dir) }
@@ -85,6 +126,28 @@ struct ComposeCLITests {
         """.write(to: composeURL, atomically: true, encoding: .utf8)
 
         let result = try ComposeCLITestSupport.run(arguments: ["up", "-f", composeURL.path, "--profile", "dev"], currentDirectory: dir)
+        #expect(result.status == 0)
+        #expect(result.stdout.contains("No services matched the provided filters. Nothing to start."))
+        #expect(result.stdout.contains("Profiles: dev"))
+    }
+
+    @Test
+    func testUpSupportsDockerStyleRootProfileOption() throws {
+        let dir = try ComposeCLITestSupport.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let composeURL = dir.appendingPathComponent("docker-compose.yml")
+        try """
+        services:
+          web:
+            image: nginx:alpine
+            profiles: [prod]
+        """.write(to: composeURL, atomically: true, encoding: .utf8)
+
+        let result = try ComposeCLITestSupport.run(
+            arguments: ["--profile", "dev", "-f", composeURL.path, "up"],
+            currentDirectory: dir
+        )
         #expect(result.status == 0)
         #expect(result.stdout.contains("No services matched the provided filters. Nothing to start."))
         #expect(result.stdout.contains("Profiles: dev"))
@@ -196,11 +259,80 @@ struct ComposeCLITests {
     }
 
     @Test
+    func testExecAcceptsDockerNoTTYFlag() throws {
+        let dir = try ComposeCLITestSupport.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let composeURL = dir.appendingPathComponent("docker-compose.yml")
+        try """
+        services:
+          app:
+            image: nginx:alpine
+        """.write(to: composeURL, atomically: true, encoding: .utf8)
+
+        let result = try ComposeCLITestSupport.run(arguments: ["exec", "-T", "-f", composeURL.path, "missing", "pwd"], currentDirectory: dir)
+        #expect(result.status != 0)
+        #expect(result.stderr.contains("Service 'missing' not found or not enabled by active profiles"))
+    }
+
+    @Test
+    func testRunRejectsUnknownServiceBeforeRuntimeAccess() throws {
+        let dir = try ComposeCLITestSupport.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let composeURL = dir.appendingPathComponent("docker-compose.yml")
+        try """
+        services:
+          app:
+            image: nginx:alpine
+        """.write(to: composeURL, atomically: true, encoding: .utf8)
+
+        let result = try ComposeCLITestSupport.run(arguments: ["run", "--rm", "-f", composeURL.path, "missing", "pwd"], currentDirectory: dir)
+        #expect(result.status != 0)
+        #expect(result.stderr.contains("Service 'missing' not found or not enabled by active profiles"))
+    }
+
+    @Test
+    func testLogsAcceptsDockerFollowShortFlag() throws {
+        let dir = try ComposeCLITestSupport.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let composeURL = dir.appendingPathComponent("docker-compose.yml")
+        try """
+        services:
+          app:
+            image: nginx:alpine
+        """.write(to: composeURL, atomically: true, encoding: .utf8)
+
+        let result = try ComposeCLITestSupport.run(arguments: ["-f", composeURL.path, "logs", "-f"], currentDirectory: dir)
+        #expect(result.status == 0)
+    }
+
+    @Test
+    func testValidateAllowsAnchorsByDefault() throws {
+        let dir = try ComposeCLITestSupport.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let composeURL = dir.appendingPathComponent("docker-compose.yml")
+        try """
+        x-common: &common
+          image: nginx:alpine
+        services:
+          web:
+            <<: *common
+        """.write(to: composeURL, atomically: true, encoding: .utf8)
+
+        let result = try ComposeCLITestSupport.run(arguments: ["validate", "-f", composeURL.path, "--quiet"], currentDirectory: dir)
+        #expect(result.status == 0)
+    }
+
+    @Test
     func testCommandHelpCoversRuntimeCommands() throws {
         let dir = try ComposeCLITestSupport.makeTempDir()
         defer { try? FileManager.default.removeItem(at: dir) }
 
         let commands = [
+            ("run", "Run a one-off command"),
             ("down", "Stop and remove containers"),
             ("ps", "List containers"),
             ("logs", "View output from containers"),

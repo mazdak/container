@@ -36,10 +36,24 @@ struct ComposeCLITestSupport {
             options: [.skipsHiddenFiles]
         )
 
+        var candidates: [URL] = []
         while let url = enumerator?.nextObject() as? URL {
-            if url.lastPathComponent == "compose", !url.path.contains(".dSYM") {
-                return url
+            guard url.lastPathComponent == "compose", !url.path.contains(".dSYM") else {
+                continue
             }
+            candidates.append(url)
+        }
+
+        if let debug = candidates.first(where: { $0.path.contains("/debug/compose") }) {
+            return debug
+        }
+
+        if let release = candidates.first(where: { $0.path.contains("/release/compose") }) {
+            return release
+        }
+
+        if let candidate = candidates.first {
+            return candidate
         }
 
         throw NSError(domain: "ComposeCLITestSupport", code: 1, userInfo: [NSLocalizedDescriptionKey: "compose binary not found under \(buildRoot.path)"])

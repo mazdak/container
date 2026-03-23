@@ -271,6 +271,22 @@ struct DependencyResolverTests {
     }
 
     @Test
+    func testResolveDeduplicatesEquivalentDependencyEdges() throws {
+        let services: [String: Service] = [
+            "db": Service(name: "db", image: "postgres", healthCheck: HealthCheck(test: ["/bin/true"])),
+            "web": Service(name: "web", image: "nginx", dependsOn: ["db"], dependsOnHealthy: ["db"])
+        ]
+
+        let resolution = try DependencyResolver.resolve(services: services)
+
+        #expect(resolution.startOrder == ["db", "web"])
+        #expect(resolution.stopOrder == ["web", "db"])
+        #expect(resolution.parallelGroups.count == 2)
+        #expect(resolution.parallelGroups[0] == ["db"])
+        #expect(resolution.parallelGroups[1] == ["web"])
+    }
+
+    @Test
     func testResolveDependsOnStarted() throws {
         let services: [String: Service] = [
             "db": Service(name: "db", image: "postgres"),
