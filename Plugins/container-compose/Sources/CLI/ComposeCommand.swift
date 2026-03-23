@@ -27,6 +27,9 @@ import ComposeCore
 struct ComposeOptions: ParsableArguments {
     @Option(name: [.customLong("file"), .customShort("f")], help: "Specify compose file(s) (can be used multiple times)")
     var file: [String] = []
+
+    @Option(name: .customLong("env-file"), help: "Specify an alternate environment file (can be used multiple times)")
+    var envFile: [String] = []
     
     @Option(name: [.customLong("project"), .customShort("p")], help: "Specify an alternate project name")
     var project: String?
@@ -174,11 +177,32 @@ struct ComposeOptions: ParsableArguments {
         _ = EnvLoader.load(from: baseDirectory, export: true, override: false)
     }
 
+    func getComposeEnvFileURLs() -> [URL] {
+        let currentPath = FileManager.default.currentDirectoryPath
+        return envFile.map { name in
+            if name.hasPrefix("/") { return URL(fileURLWithPath: name) }
+            return URL(fileURLWithPath: currentPath).appendingPathComponent(name)
+        }
+    }
+
+    func loadExplicitEnvFilesIfPresent() {
+        for url in getComposeEnvFileURLs() {
+            _ = EnvLoader.load(fileURL: url, export: true, override: false, logger: log)
+        }
+    }
+
     func prepareEnvironment(fileURLs: [URL]) {
         setEnvironmentVariables()
+        if !envFile.isEmpty {
+            loadExplicitEnvFilesIfPresent()
+        }
     }
 
     func exportDotEnvForEnvFileExpansion(fileURLs: [URL]) {
-        loadDotEnvIfPresent(from: getProjectDirectory(fileURLs: fileURLs))
+        if !envFile.isEmpty {
+            loadExplicitEnvFilesIfPresent()
+        } else {
+            loadDotEnvIfPresent(from: getProjectDirectory(fileURLs: fileURLs))
+        }
     }
 }

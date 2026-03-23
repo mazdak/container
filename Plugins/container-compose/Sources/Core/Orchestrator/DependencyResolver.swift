@@ -96,7 +96,9 @@ public struct DependencyResolver {
         // Build dependency graph
         for (name, service) in services {
             // Handle all dependency types
-            let allDependencies = service.dependsOn + service.dependsOnHealthy + service.dependsOnStarted + service.dependsOnCompletedSuccessfully
+            let allDependencies = Array(
+                Set(service.dependsOn + service.dependsOnHealthy + service.dependsOnStarted + service.dependsOnCompletedSuccessfully)
+            )
 
             for dependency in allDependencies {
                 // Validate dependency exists
@@ -193,7 +195,14 @@ public struct DependencyResolver {
             
             if let serviceConfig = services[service] {
                 // Check all dependency types for cycles
-                let allDependencies = serviceConfig.dependsOn + serviceConfig.dependsOnHealthy + serviceConfig.dependsOnStarted + serviceConfig.dependsOnCompletedSuccessfully
+                let allDependencies = Array(
+                    Set(
+                        serviceConfig.dependsOn
+                            + serviceConfig.dependsOnHealthy
+                            + serviceConfig.dependsOnStarted
+                            + serviceConfig.dependsOnCompletedSuccessfully
+                    )
+                )
                 for dependency in allDependencies {
                     try hasCycle(service: dependency, path: path + [service])
                 }
@@ -254,11 +263,15 @@ public struct DependencyResolver {
                 build: service.build,
                 command: service.command,
                 entrypoint: service.entrypoint,
+                commandCleared: service.commandCleared,
+                entrypointCleared: service.entrypointCleared,
                 workingDir: service.workingDir,
                 environment: service.environment,
                 ports: service.ports,
                 volumes: service.volumes,
                 networks: service.networks,
+                networkMode: service.networkMode,
+                networkAliases: service.networkAliases,
                 dependsOn: service.dependsOn.filter(selectedNames.contains),
                 dependsOnHealthy: service.dependsOnHealthy.filter(selectedNames.contains),
                 dependsOnStarted: service.dependsOnStarted.filter(selectedNames.contains),
@@ -269,6 +282,7 @@ public struct DependencyResolver {
                 containerName: service.containerName,
                 profiles: service.profiles,
                 labels: service.labels,
+                extraHosts: service.extraHosts,
                 cpus: service.cpus,
                 memory: service.memory,
                 tty: service.tty,

@@ -185,6 +185,28 @@ struct OrchestratorBuildTests {
     }
 
     @Test
+    func testResolvedProcessEnvironmentIncludesImageDefaultsAndServiceOverrides() throws {
+        let orchestrator = Orchestrator(log: log)
+
+        let environment = orchestrator.resolvedProcessEnvironment(
+            imageEnvironment: [
+                "PATH=/usr/local/bin:/usr/bin",
+                "GF_PATHS_HOME=/usr/share/grafana",
+                "UNPARSEABLE"
+            ],
+            serviceEnvironment: [
+                "PATH": "/custom/bin:/usr/local/bin:/usr/bin",
+                "GF_PATHS_DATA": "/var/lib/grafana"
+            ]
+        )
+
+        #expect(environment.contains("PATH=/custom/bin:/usr/local/bin:/usr/bin"))
+        #expect(environment.contains("GF_PATHS_HOME=/usr/share/grafana"))
+        #expect(environment.contains("GF_PATHS_DATA=/var/lib/grafana"))
+        #expect(!environment.contains("UNPARSEABLE"))
+    }
+
+    @Test
     func testOrchestratorCleanupFunctionality() async throws {
         // Test that the orchestrator can be created and basic functionality works
         _ = Orchestrator(log: log)

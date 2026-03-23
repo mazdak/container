@@ -182,6 +182,30 @@ struct ProjectConverterTests {
     }
 
     @Test
+    func testConvertServiceWithBridgeNetworkMode() throws {
+        let yaml = """
+        version: '3'
+        services:
+          backend:
+            image: nginx:latest
+            network_mode: bridge
+        networks:
+          appnet:
+            driver: bridge
+        """
+
+        let parser = ComposeParser(log: log)
+        let composeFile = try parser.parse(from: yaml.data(using: .utf8)!)
+
+        let converter = ProjectConverter(log: log)
+        let project = try converter.convert(composeFile: composeFile, projectName: "testapp")
+
+        let backendService = try #require(project.services["backend"])
+        #expect(backendService.networkMode == "bridge")
+        #expect(backendService.networks == ["default"])
+    }
+
+    @Test
     func testPortRangeExpansion() throws {
         let yaml = """
         version: '3'

@@ -1219,12 +1219,16 @@ public actor Orchestrator {
         let finalArgs = resolveProcessCommand()
         let execPath = finalArgs.first ?? "/bin/sh"
         let execArgs = Array(finalArgs.dropFirst())
+        let processEnvironment = resolvedProcessEnvironment(
+            imageEnvironment: imageConfig?.env ?? [],
+            serviceEnvironment: service.environment
+        )
 
         // Create process configuration
         let processConfig = ProcessConfiguration(
             executable: execPath,
             arguments: execArgs,
-            environment: service.environment.map { "\($0.key)=\($0.value)" },
+            environment: processEnvironment,
             workingDirectory: service.workingDir ?? (imageConfig?.workingDir ?? "/"),
             terminal: service.tty
         )
@@ -1243,11 +1247,15 @@ public actor Orchestrator {
         labels["com.apple.compose.container"] = config.id
 
         // Attach networks for this service and opt into runtime-managed container DNS.
-        let networkIds = try mapServiceNetworkIds(project: project, service: service)
+        let networkIds = try resolvedAttachmentNetworkIds(project: project, service: service)
         let networking = try makeContainerNetworkingConfiguration(containerId: config.id, networkIds: networkIds)
         config.networks = networking.attachments
         config.dns = networking.dns
         config.hosts = try await resolveComposeHosts(
+            project: project,
+            serviceName: serviceName,
+            service: service,
+            networkIds: networkIds,
             extraHosts: service.extraHosts,
             primaryNetworkId: networking.attachments.first?.network
         )
@@ -1373,15 +1381,24 @@ public actor Orchestrator {
                 result.append(Filesystem.tmpfs(destination: v.target, options: v.readOnly ? ["ro"] : []))
             case .volume:
                 let name = try resolveVolumeName(project: project, serviceName: serviceName, mount: v)
-                let vol = try await ensureVolume(name: name, isExternal: project.volumes[name]?.external ?? false, project: project, serviceName: serviceName, target: v.target)
-                try await volumePopulator.populateIfNeeded(
-                    volume: vol,
-                    mount: v,
-                    imageName: imageName,
+                let ensured = try await ensureVolume(
+                    name: name,
+                    isExternal: project.volumes[name]?.external ?? false,
                     project: project,
                     serviceName: serviceName,
-                    log: log
+                    target: v.target
                 )
+                if ensured.created {
+                    try await volumePopulator.populateIfNeeded(
+                        volume: ensured.volume,
+                        mount: v,
+                        imageName: imageName,
+                        project: project,
+                        serviceName: serviceName,
+                        log: log
+                    )
+                }
+                let vol = ensured.volume
                 result.append(Filesystem.volume(name: vol.name, format: vol.format, source: vol.source, destination: v.target, options: v.readOnly ? ["ro"] : [], cache: .auto, sync: .full))
             }
         }
@@ -1423,9 +1440,15 @@ public actor Orchestrator {
     }
 
     /// Ensure a named volume exists; create if missing (unless external). Return inspected volume with host path/format.
-    internal func ensureVolume(name: String, isExternal: Bool, project: Project, serviceName: String, target: String) async throws -> ContainerResource.Volume {
+    internal func ensureVolume(
+        name: String,
+        isExternal: Bool,
+        project: Project,
+        serviceName: String,
+        target: String
+    ) async throws -> (volume: ContainerResource.Volume, created: Bool) {
         do {
-            return try await volumeClient.inspect(name: name)
+            return (try await volumeClient.inspect(name: name), false)
         } catch {
             if isExternal {
                 throw ContainerizationError(.notFound, message: "external volume '\(name)' not found")
@@ -1438,7 +1461,7 @@ public actor Orchestrator {
                 "com.apple.compose.anonymous": String(name.contains("_anon_"))
             ]
             _ = try await volumeClient.create(name: name, driver: "local", driverOpts: [:], labels: labels)
-            return try await volumeClient.inspect(name: name)
+            return (try await volumeClient.inspect(name: name), true)
         }
     }
 
@@ -1749,6 +1772,17 @@ public actor Orchestrator {
 
     /// Map declared service networks to Apple Container network IDs, honoring external vs project-scoped.
     nonisolated internal func mapServiceNetworkIds(project: Project, service: Service) throws -> [String] {
+        if let networkMode = service.networkMode?.lowercased() {
+            switch networkMode {
+            case "bridge":
+                return []
+            default:
+                throw ContainerizationError(
+                    .invalidArgument,
+                    message: "unsupported network_mode '\(networkMode)'; only 'bridge' is currently supported"
+                )
+            }
+        }
         guard !service.networks.isEmpty else { return [] }
         // macOS gate aligns with Utility.getAttachmentConfigurations behavior
         guard #available(macOS 26, *) else {
@@ -1761,6 +1795,21 @@ public actor Orchestrator {
                               external: def?.external ?? false,
                               externalName: def?.externalName)
         }
+    }
+
+    nonisolated internal func resolvedAttachmentNetworkIds(project: Project, service: Service) throws -> [String] {
+        let explicitNetworkIds = try mapServiceNetworkIds(project: project, service: service)
+        guard shouldAttachRuntimeDefaultNetwork(service: service, explicitNetworkIds: explicitNetworkIds) else {
+            return explicitNetworkIds
+        }
+        return [ClientNetwork.defaultNetworkName] + explicitNetworkIds.filter { $0 != ClientNetwork.defaultNetworkName }
+    }
+
+    nonisolated internal func shouldAttachRuntimeDefaultNetwork(service: Service, explicitNetworkIds: [String]? = nil) -> Bool {
+        guard service.networkMode == nil else { return false }
+        let hasExplicitComposeNetworks = !(explicitNetworkIds ?? service.networks).isEmpty
+        guard hasExplicitComposeNetworks else { return false }
+        return service.extraHosts.contains { $0.address == "host-gateway" }
     }
 
     nonisolated private func networkId(for project: Project, networkName: String, external: Bool, externalName: String?) -> String {
@@ -1808,16 +1857,107 @@ public actor Orchestrator {
     }
 
     internal func resolveComposeHosts(
+        project: Project,
+        serviceName: String,
+        service: Service,
+        networkIds: [String],
         extraHosts: [ExtraHost],
         primaryNetworkId: String?
     ) async throws -> [ContainerConfiguration.HostEntry] {
-        guard !extraHosts.isEmpty else { return [] }
+        let peerHosts = try await resolveComposePeerHosts(
+            project: project,
+            serviceName: serviceName,
+            service: service
+        )
+
+        guard !extraHosts.isEmpty else { return peerHosts }
 
         let gatewayAddress = try await resolveHostGatewayAddress(primaryNetworkId: primaryNetworkId)
-        return extraHosts.map { host in
+        let resolvedExtraHosts = extraHosts.map { host in
             let address = host.address == "host-gateway" ? gatewayAddress : host.address
             return ContainerConfiguration.HostEntry(ipAddress: address, hostnames: [host.hostname])
         }
+        return mergeHostEntries(peerHosts + resolvedExtraHosts)
+    }
+
+    internal func resolveComposePeerHosts(
+        project: Project,
+        serviceName: String,
+        service: Service
+    ) async throws -> [ContainerConfiguration.HostEntry] {
+        guard !service.networks.isEmpty else { return [] }
+
+        let allContainers = try await containerClient.list()
+        return try composePeerHosts(
+            project: project,
+            serviceName: serviceName,
+            service: service,
+            containers: allContainers
+        )
+    }
+
+    nonisolated internal func composePeerHosts(
+        project: Project,
+        serviceName: String,
+        service: Service,
+        containers: [ContainerSnapshot]
+    ) throws -> [ContainerConfiguration.HostEntry] {
+        guard !service.networks.isEmpty else { return [] }
+
+        let currentNetworkIds = Dictionary(
+            uniqueKeysWithValues: service.networks.map { networkName in
+                let network = project.networks[networkName]
+                let resolvedNetworkName = network?.name ?? networkName
+                let networkId = networkId(
+                    for: project,
+                    networkName: resolvedNetworkName,
+                    external: network?.external ?? false,
+                    externalName: network?.externalName
+                )
+                return (networkId, networkName)
+            }
+        )
+
+        var hostnamesByAddress: [String: Set<String>] = [:]
+
+        for peerContainer in containers {
+            guard peerContainer.status == .running else { continue }
+            guard peerContainer.configuration.labels["com.apple.compose.project"] == project.name else { continue }
+            guard let peerServiceName = peerContainer.configuration.labels["com.apple.compose.service"] else { continue }
+            guard peerServiceName != serviceName else { continue }
+
+            for attachment in peerContainer.networks {
+                guard let networkName = currentNetworkIds[attachment.network] else { continue }
+
+                let address = attachment.ipv4Address.address.description
+                var hostnames = hostnamesByAddress[address] ?? []
+                hostnames.insert(peerServiceName)
+                if let peerService = project.services[peerServiceName] {
+                    hostnames.formUnion(peerService.networkAliases[networkName] ?? [])
+                }
+                hostnamesByAddress[address] = hostnames
+                break
+            }
+        }
+
+        return hostnamesByAddress.map { address, hostnames in
+            ContainerConfiguration.HostEntry(
+                ipAddress: address,
+                hostnames: Array(hostnames).sorted()
+            )
+        }
+        .sorted { $0.ipAddress < $1.ipAddress }
+    }
+
+    nonisolated private func mergeHostEntries(_ entries: [ContainerConfiguration.HostEntry]) -> [ContainerConfiguration.HostEntry] {
+        var hostnamesByAddress: [String: Set<String>] = [:]
+        for entry in entries {
+            hostnamesByAddress[entry.ipAddress, default: []].formUnion(entry.hostnames)
+        }
+        return hostnamesByAddress.map { ipAddress, hostnames in
+            ContainerConfiguration.HostEntry(ipAddress: ipAddress, hostnames: Array(hostnames).sorted())
+        }
+        .sorted { $0.ipAddress < $1.ipAddress }
     }
 
     internal func resolveHostGatewayAddress(primaryNetworkId: String?) async throws -> String {
@@ -2176,6 +2316,156 @@ public actor Orchestrator {
         installSignal(SIGTERM)
 
         return try await process.wait()
+    }
+
+    public func run(
+        project: Project,
+        serviceName: String,
+        command: [String],
+        detach: Bool = false,
+        interactive: Bool = false,
+        tty: Bool = false,
+        user: String? = nil,
+        workdir: String? = nil,
+        environment: [String] = [],
+        noDeps: Bool = false,
+        removeOnExit: Bool = false,
+        pullPolicy: PullPolicy = .missing
+    ) async throws -> Int32 {
+        guard let service = project.services[serviceName] else {
+            throw ContainerizationError(.notFound, message: "Service '\(serviceName)' not found")
+        }
+
+        if !noDeps {
+            let scoped = DependencyResolver.filterWithDependencies(services: project.services, selected: [serviceName])
+            let dependencyServices = scoped.filter { $0.key != serviceName }
+            if !dependencyServices.isEmpty {
+                let dependencyProject = Project(
+                    name: project.name,
+                    services: dependencyServices,
+                    networks: project.networks,
+                    volumes: project.volumes
+                )
+                try await up(
+                    project: dependencyProject,
+                    services: Array(dependencyServices.keys),
+                    detach: true,
+                    noDeps: false,
+                    removeOnExit: false,
+                    pullPolicy: pullPolicy
+                )
+            }
+        }
+
+        let imageName = service.image ?? "\(project.name)-\(serviceName)"
+        try await ensureComposeNetworks(project: project)
+        try await buildImagesIfNeeded(project: project, services: [serviceName: service], progressHandler: nil)
+        try await ensureImageAvailable(serviceName: serviceName, service: service, imageName: imageName, policy: pullPolicy)
+
+        let mergedEnvironment = resolveRunEnvironment(base: service.environment, overrides: environment)
+        let runContainerId = oneOffContainerId(projectName: project.name, serviceName: serviceName)
+        let runService = Service(
+            name: service.name,
+            image: service.image,
+            build: service.build,
+            command: command.isEmpty ? service.command : command,
+            entrypoint: service.entrypoint,
+            commandCleared: command.isEmpty ? service.commandCleared : false,
+            entrypointCleared: service.entrypointCleared,
+            workingDir: workdir ?? service.workingDir,
+            environment: mergedEnvironment,
+            ports: service.ports,
+            volumes: service.volumes,
+            networks: service.networks,
+            networkMode: service.networkMode,
+            networkAliases: service.networkAliases,
+            dependsOn: service.dependsOn,
+            dependsOnHealthy: service.dependsOnHealthy,
+            dependsOnStarted: service.dependsOnStarted,
+            dependsOnCompletedSuccessfully: service.dependsOnCompletedSuccessfully,
+            healthCheck: service.healthCheck,
+            deploy: service.deploy,
+            restart: service.restart,
+            containerName: runContainerId,
+            profiles: service.profiles,
+            labels: service.labels,
+            extraHosts: service.extraHosts,
+            cpus: service.cpus,
+            memory: service.memory,
+            tty: tty,
+            stdinOpen: interactive
+        )
+
+        let kernel = try await ClientKernel.getDefaultKernel(for: .current)
+        let containerConfig = try await createContainerConfiguration(
+            project: project,
+            serviceName: serviceName,
+            service: runService,
+            imageName: imageName,
+            removeOnExit: removeOnExit
+        )
+        let createOptions = ContainerCreateOptions(autoRemove: removeOnExit)
+        try await containerClient.create(
+            configuration: containerConfig,
+            options: createOptions,
+            kernel: kernel
+        )
+        let container = try await containerClient.get(id: containerConfig.id)
+
+        var stdio: [FileHandle?] = [nil, FileHandle.standardOutput, FileHandle.standardError]
+        if interactive || tty {
+            stdio[0] = FileHandle.standardInput
+        }
+
+        let process = try await containerClient.bootstrap(id: container.id, stdio: stdio)
+        try await process.start()
+
+        if detach {
+            return 0
+        }
+
+        return try await process.wait()
+    }
+
+    internal func resolveRunEnvironment(base: [String: String], overrides: [String]) -> [String: String] {
+        var result = base
+        for override in overrides {
+            let parts = override.split(separator: "=", maxSplits: 1)
+            if parts.count == 2 {
+                result[String(parts[0])] = String(parts[1])
+                continue
+            }
+
+            let key = String(override)
+            if let value = ProcessInfo.processInfo.environment[key] {
+                result[key] = value
+            }
+        }
+        return result
+    }
+
+    nonisolated internal func resolvedProcessEnvironment(
+        imageEnvironment: [String],
+        serviceEnvironment: [String: String]
+    ) -> [String] {
+        var merged: [String: String] = [:]
+
+        for entry in imageEnvironment {
+            guard let separator = entry.firstIndex(of: "=") else { continue }
+            let key = String(entry[..<separator])
+            let value = String(entry[entry.index(after: separator)...])
+            merged[key] = value
+        }
+
+        for (key, value) in serviceEnvironment {
+            merged[key] = value
+        }
+
+        return merged.map { "\($0.key)=\($0.value)" }.sorted()
+    }
+
+    internal func oneOffContainerId(projectName: String, serviceName: String) -> String {
+        "\(projectName)_\(serviceName)_run_\(UUID().uuidString.lowercased())"
     }
 
     /// Check health of services

@@ -24,8 +24,8 @@ struct ComposeGlobalOptions: ParsableArguments {
     @OptionGroup
     var shared: Flags.Logging
 
-    @Flag(name: .long, help: "Allow YAML anchors and merge keys in compose files")
-    var allowAnchors = false
+    @Flag(name: .long, inversion: .prefixedNo, help: "Allow YAML anchors and merge keys in compose files")
+    var allowAnchors = true
 
     var debug: Bool {
         shared.debug
@@ -47,6 +47,8 @@ struct ComposePlugin: AsyncParsableCommand {
         commandName: "compose",
         abstract: "Manage multi-container applications",
         subcommands: [
+            ComposeBuild.self,
+            ComposeRun.self,
             ComposeUp.self,
             ComposeDown.self,
             ComposePS.self,
@@ -60,4 +62,101 @@ struct ComposePlugin: AsyncParsableCommand {
             ComposeRm.self,
         ]
     )
+
+    static func main() async throws {
+        let args = ComposeArgumentNormalizer.normalize(Array(CommandLine.arguments.dropFirst()))
+
+        do {
+            var command = try Self.parseAsRoot(args)
+            if var asyncCommand = command as? AsyncParsableCommand {
+                try await asyncCommand.run()
+            } else {
+                try command.run()
+            }
+        } catch {
+            Self.exit(withError: error)
+        }
+    }
+}
+
+enum ComposeArgumentNormalizer {
+    static let subcommands: Set<String> = [
+        "build", "run", "up", "down", "ps", "start", "stop", "restart", "logs", "exec", "health", "validate", "rm",
+    ]
+
+    private static let rootFlags: [String: String] = [
+        "--debug": "--debug",
+        "--allow-anchors": "--allow-anchors",
+    ]
+
+    private static let rootOptionsWithValues: [String: String] = [
+        "-f": "--file",
+        "--file": "--file",
+        "-p": "--project",
+        "--project": "--project",
+        "--profile": "--profile",
+        "--set-env": "--set-env",
+        "--env-file": "--env-file",
+    ]
+
+    static func normalize(_ arguments: [String]) -> [String] {
+        guard let subcommandIndex = arguments.firstIndex(where: { subcommands.contains($0) }) else {
+            return arguments
+        }
+
+        var movedRootOptions: [String] = []
+        var prefix: [String] = []
+        var index = 0
+
+        while index < subcommandIndex {
+            let argument = arguments[index]
+
+            if let rewritten = rewriteRootFlag(argument) {
+                movedRootOptions.append(rewritten)
+                index += 1
+                continue
+            }
+
+            if let (tokens, consumed) = rewriteRootOption(argument, nextArgument: index + 1 < subcommandIndex ? arguments[index + 1] : nil) {
+                movedRootOptions.append(contentsOf: tokens)
+                index += consumed
+                continue
+            }
+
+            prefix.append(argument)
+            index += 1
+        }
+
+        let subcommand = arguments[subcommandIndex]
+        let suffix = normalizeSubcommandArguments(Array(arguments.dropFirst(subcommandIndex + 1)), subcommand: subcommand)
+        return prefix + [subcommand] + movedRootOptions + suffix
+    }
+
+    private static func rewriteRootFlag(_ argument: String) -> String? {
+        rootFlags[argument]
+    }
+
+    private static func rewriteRootOption(_ argument: String, nextArgument: String?) -> ([String], Int)? {
+        if let canonical = rootOptionsWithValues[argument] {
+            guard let nextArgument else { return ([canonical], 1) }
+            return ([canonical, nextArgument], 2)
+        }
+
+        for (option, canonical) in rootOptionsWithValues where argument.hasPrefix(option + "=") {
+            let value = String(argument.dropFirst(option.count + 1))
+            return ([canonical, value], 1)
+        }
+
+        return nil
+    }
+
+    private static func normalizeSubcommandArguments(_ arguments: [String], subcommand: String) -> [String] {
+        guard subcommand == "logs" else {
+            return arguments
+        }
+
+        return arguments.map { argument in
+            argument == "-f" ? "--follow" : argument
+        }
+    }
 }

@@ -667,6 +667,29 @@ struct ComposeParserTests {
 
         #expect(app.image == "${\(literalVariable)}/app:latest")
     }
+
+    @Test
+    func testParseFilePreservesServiceNetworkMode() throws {
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        try """
+        services:
+          app:
+            image: nginx:latest
+            network_mode: bridge
+        networks:
+          appnet:
+            driver: bridge
+        """.write(to: tempDir.appendingPathComponent("compose.yaml"), atomically: true, encoding: .utf8)
+
+        let parser = ComposeParser(log: log)
+        let composeFile = try parser.parse(from: [tempDir.appendingPathComponent("compose.yaml")])
+        let app = try #require(composeFile.services["app"])
+
+        #expect(app.networkMode == "bridge")
+    }
     
     @Test
     func testParseNonExistentFile() throws {

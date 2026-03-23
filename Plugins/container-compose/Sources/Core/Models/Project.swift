@@ -70,6 +70,8 @@ public struct Service: Sendable {
     public let ports: [PortMapping]
     public let volumes: [VolumeMount]
     public let networks: [String]
+    public let networkMode: String?
+    public let networkAliases: [String: [String]]
     public let dependsOn: [String]
     public let dependsOnHealthy: [String]
     public let dependsOnStarted: [String]
@@ -100,6 +102,8 @@ public struct Service: Sendable {
                  ports: [PortMapping] = [],
                  volumes: [VolumeMount] = [],
                  networks: [String] = [],
+                 networkMode: String? = nil,
+                 networkAliases: [String: [String]] = [:],
                  dependsOn: [String] = [],
                  dependsOnHealthy: [String] = [],
                  dependsOnStarted: [String] = [],
@@ -127,6 +131,8 @@ public struct Service: Sendable {
         self.ports = ports
         self.volumes = volumes
         self.networks = networks
+        self.networkMode = networkMode
+        self.networkAliases = networkAliases
         self.dependsOn = dependsOn
         self.dependsOnHealthy = dependsOnHealthy
         self.dependsOnStarted = dependsOnStarted

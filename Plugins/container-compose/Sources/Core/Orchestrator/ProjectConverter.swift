@@ -152,6 +152,7 @@ public struct ProjectConverter {
             volumes: mergeArrays(base: base.volumes, override: override.volumes),
             ports: mergeArrays(base: base.ports, override: override.ports),
             networks: override.networks ?? base.networks,
+            networkMode: override.networkMode ?? base.networkMode,
             dependsOn: override.dependsOn ?? base.dependsOn,
             deploy: override.deploy ?? base.deploy,
             memLimit: override.memLimit ?? base.memLimit,
@@ -401,14 +402,14 @@ public struct ProjectConverter {
         for (k, v) in (service.environment?.asDictionary ?? [:]) { environment[k] = v }
         
         // Get networks
-        let networks: [String] = {
+        let (networks, networkAliases): ([String], [String: [String]]) = {
             switch service.networks {
             case .list(let list):
-                return list
+                return (list, [:])
             case .dict(let dict):
-                return Array(dict.keys)
+                return (Array(dict.keys), dict.mapValues { $0.aliases ?? [] })
             case nil:
-                return ["default"]
+                return (["default"], [:])
             }
         }()
         
@@ -491,6 +492,8 @@ public struct ProjectConverter {
             ports: ports,
             volumes: volumes,
             networks: networks,
+            networkMode: service.networkMode,
+            networkAliases: networkAliases,
             dependsOn: dependsOn,
             dependsOnHealthy: dependsOnHealthy,
             dependsOnStarted: dependsOnStarted,

@@ -100,6 +100,7 @@ public struct ComposeFileMerger {
             volumes: mergeServiceVolumes(base: base.volumes, override: override.volumes),
             ports: mergeStringArrays(base: base.ports, override: override.ports),
             networks: mergeNetworkConfig(base: base.networks, override: override.networks),
+            networkMode: override.networkMode ?? base.networkMode,
             dependsOn: mergeDependsOn(base: base.dependsOn, override: override.dependsOn),
             deploy: override.deploy ?? base.deploy,
             memLimit: override.memLimit ?? base.memLimit,
