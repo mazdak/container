@@ -112,8 +112,10 @@ public struct DefaultHealthCheckRunner: HealthCheckRunner {
             )
             try await process.start()
 
-            // Wait for process completion
-            let result = try await process.wait()
+            let result = try await waitForHealthCheckExit(
+                process: process,
+                timeout: healthCheck.timeout
+            )
 
             // Check exit status
             let success = result == 0
@@ -124,18 +126,60 @@ public struct DefaultHealthCheckRunner: HealthCheckRunner {
             }
 
             return success
-
+        } catch let error as TimeoutError {
+            log.warning("Health check timed out after \(error.duration)s")
+            return false
         } catch {
             log.error("Health check execution failed: \(error.localizedDescription)")
             return false
         }
     }
 
-    private struct TimeoutError: Error {
+    struct TimeoutError: Error {
         let duration: TimeInterval
     }
 
+    internal func waitForHealthCheckExit(
+        process: any ClientProcess,
+        timeout: TimeInterval?
+    ) async throws -> Int32 {
+        guard let timeout, timeout > 0 else {
+            return try await process.wait()
+        }
 
+        enum WaitOutcome {
+            case exited(Int32)
+            case timedOut
+        }
+
+        return try await withThrowingTaskGroup(of: WaitOutcome.self) { group in
+            group.addTask {
+                .exited(try await process.wait())
+            }
+            group.addTask {
+                try await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+                return .timedOut
+            }
+
+            guard let first = try await group.next() else {
+                throw ContainerizationError(.internalError, message: "health check wait did not produce a result")
+            }
+
+            switch first {
+            case .exited(let exitCode):
+                group.cancelAll()
+                return exitCode
+            case .timedOut:
+                try? await process.kill(SIGKILL)
+                while let outcome = try await group.next() {
+                    if case .exited = outcome {
+                        break
+                    }
+                }
+                throw TimeoutError(duration: timeout)
+            }
+        }
+    }
 }
 
 // MARK: - BuildService
@@ -1547,7 +1591,6 @@ public actor Orchestrator {
             project: project,
             serviceName: serviceName,
             service: service,
-            imageName: imageName,
             configuration: config
         )
         config.labels = labels
@@ -1573,7 +1616,6 @@ public actor Orchestrator {
             project: project,
             serviceName: serviceName,
             service: service,
-            imageName: imageName,
             configuration: configuration
         )
     }
@@ -1639,14 +1681,13 @@ public actor Orchestrator {
         project: Project,
         serviceName: String,
         service: Service,
-        imageName: String,
         configuration: ContainerConfiguration
     ) -> String {
         computeConfigHash(
             project: project,
             serviceName: serviceName,
             service: service,
-            imageName: imageName,
+            image: configuration.image,
             process: configuration.initProcess,
             ports: configuration.publishedPorts,
             mounts: configuration.mounts,
@@ -1660,7 +1701,7 @@ public actor Orchestrator {
         project: Project,
         serviceName: String,
         service: Service,
-        imageName: String,
+        image: ImageDescription,
         process: ProcessConfiguration,
         ports: [PublishPort],
         mounts: [Filesystem],
@@ -1669,7 +1710,12 @@ public actor Orchestrator {
         hosts: [ContainerConfiguration.HostEntry]
     ) -> String {
         let sig = ConfigSignature(
-            image: imageName,
+            image: ImageSig(
+                reference: image.reference,
+                digest: image.descriptor.digest,
+                mediaType: image.descriptor.mediaType,
+                size: image.descriptor.size
+            ),
             executable: process.executable,
             arguments: process.arguments,
             workdir: process.workingDirectory,
@@ -1826,7 +1872,7 @@ public actor Orchestrator {
     }
 
     private struct ConfigSignature: Codable {
-        let image: String
+        let image: ImageSig
         let executable: String
         let arguments: [String]
         let workdir: String
@@ -1881,7 +1927,7 @@ public actor Orchestrator {
         }
 
         struct Canonical: Codable {
-            let image: String
+            let image: ImageSig
             let executable: String
             let arguments: [String]
             let workdir: String
@@ -1896,6 +1942,13 @@ public actor Orchestrator {
             let labels: [LabelSig]
             let health: HealthSig?
         }
+    }
+
+    private struct ImageSig: Codable {
+        let reference: String
+        let digest: String
+        let mediaType: String
+        let size: Int64
     }
 
     private struct LabelSig: Codable {
@@ -2556,12 +2609,9 @@ public actor Orchestrator {
         // Optionally remove volumes defined in the project (non-external)
         var removedVolumes: [String] = []
         if removeVolumes {
-            for (logicalName, vol) in project.volumes {
-                if !vol.external {
-                    let volumeName = resolvedProjectVolumeName(project: project, logicalName: logicalName)
-                    do { try await ClientVolume.delete(name: volumeName); removedVolumes.append(volumeName) }
-                    catch { log.warning("failed to delete volume \(volumeName): \(error)") }
-                }
+            for volumeName in managedVolumeNamesForRemoval(project: project) {
+                do { try await volumeClient.delete(name: volumeName); removedVolumes.append(volumeName) }
+                catch { log.warning("failed to delete volume \(volumeName): \(error)") }
             }
 
             // Also remove anonymous per-service volumes created for bare "/path" mounts
@@ -3076,9 +3126,7 @@ public actor Orchestrator {
         )
         if let user = user { proc.user = .raw(userString: user) }
 
-        // Attach stdio when not detached
-        let stdin: FileHandle? = interactive || tty ? FileHandle.standardInput : nil
-        let stdio: [FileHandle?] = [stdin, FileHandle.standardOutput, FileHandle.standardError]
+        let stdio = processStdio(detach: detach, interactive: interactive, tty: tty)
 
         let pid = "exec-\(UUID().uuidString)"
         let process = try await containerClient.createProcess(
@@ -3169,10 +3217,7 @@ public actor Orchestrator {
         )
         let container = try await containerClient.get(id: containerConfig.id)
 
-        var stdio: [FileHandle?] = [nil, FileHandle.standardOutput, FileHandle.standardError]
-        if interactive || tty {
-            stdio[0] = FileHandle.standardInput
-        }
+        let stdio = processStdio(detach: detach, interactive: interactive, tty: tty)
 
         let process = try await containerClient.bootstrap(id: container.id, stdio: stdio)
         try await process.start()
@@ -3241,6 +3286,19 @@ public actor Orchestrator {
         service.effectiveImageName(projectName: projectName)
     }
 
+    nonisolated internal func processStdio(
+        detach: Bool,
+        interactive: Bool,
+        tty: Bool
+    ) -> [FileHandle?] {
+        guard !detach else {
+            return [nil, nil, nil]
+        }
+
+        let stdin: FileHandle? = interactive || tty ? FileHandle.standardInput : nil
+        return [stdin, FileHandle.standardOutput, FileHandle.standardError]
+    }
+
     nonisolated internal func makeOneOffRunService(
         service: Service,
         command: [String],
@@ -3249,7 +3307,7 @@ public actor Orchestrator {
         containerName: String,
         tty: Bool,
         interactive: Bool
-    ) -> Service {
+        ) -> Service {
         Service(
             name: service.name,
             image: service.image,
@@ -3281,6 +3339,25 @@ public actor Orchestrator {
             tty: tty,
             stdinOpen: interactive
         )
+    }
+
+    nonisolated internal func managedVolumeNamesForRemoval(project: Project) -> [String] {
+        var volumeNames = Set<String>()
+
+        for (logicalName, volume) in project.volumes where !volume.external {
+            volumeNames.insert(resolvedProjectVolumeName(project: project, logicalName: logicalName))
+        }
+
+        for service in project.services.values {
+            for mount in service.volumes where mount.type == .volume && !mount.source.isEmpty {
+                if let volume = project.volumes[mount.source], volume.external {
+                    continue
+                }
+                volumeNames.insert(resolvedProjectVolumeName(project: project, logicalName: mount.source))
+            }
+        }
+
+        return volumeNames.sorted()
     }
 
     internal func resolveRunEnvironment(base: [String: String], overrides: [String]) -> [String: String] {

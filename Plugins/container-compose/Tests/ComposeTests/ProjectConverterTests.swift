@@ -225,6 +225,32 @@ struct ProjectConverterTests {
     }
 
     @Test
+    func testConvertServicePreservesEnvironmentListValuesAndPassthroughEntries() throws {
+        let passthroughKey = "COMPOSE_TEST_ENV_\(UUID().uuidString.replacingOccurrences(of: "-", with: "_"))"
+        setenv(passthroughKey, "from-process", 1)
+        defer { unsetenv(passthroughKey) }
+
+        let yaml = """
+        version: '3'
+        services:
+          backend:
+            image: nginx:latest
+            environment:
+              - \(passthroughKey)
+              - PASSWORD=abc#123
+        """
+
+        let parser = ComposeParser(log: log)
+        let composeFile = try parser.parse(from: yaml.data(using: .utf8)!)
+        let converter = ProjectConverter(log: log)
+        let project = try converter.convert(composeFile: composeFile, projectName: "testapp")
+
+        let backendService = try #require(project.services["backend"])
+        #expect(backendService.environment[passthroughKey] == "from-process")
+        #expect(backendService.environment["PASSWORD"] == "abc#123")
+    }
+
+    @Test
     func testPortRangeExpansion() throws {
         let yaml = """
         version: '3'
@@ -285,6 +311,50 @@ struct ProjectConverterTests {
         #expect(svc.volumes[0].type == .volume)
         #expect(svc.volumes[0].source.isEmpty)
         #expect(svc.volumes[0].target == "/cache")
+    }
+
+    @Test
+    func testInvalidShortFormVolumeEntryFailsConversion() {
+        let composeFile = ComposeFile(
+            services: [
+                "svc": ComposeService(
+                    image: "alpine",
+                    volumes: [.string("data")]
+                )
+            ]
+        )
+
+        do {
+            _ = try ProjectConverter(log: log).convert(composeFile: composeFile, projectName: "p")
+            Issue.record("Expected invalid volume mount to fail conversion")
+        } catch let typedError as ContainerizationError {
+            #expect(typedError.code == .invalidArgument)
+            #expect(typedError.message.contains("Invalid volume mount 'data'"))
+        } catch {
+            Issue.record("Expected ContainerizationError, got \(error)")
+        }
+    }
+
+    @Test
+    func testMalformedShortFormVolumeEntryFailsConversion() {
+        let composeFile = ComposeFile(
+            services: [
+                "svc": ComposeService(
+                    image: "alpine",
+                    volumes: [.string("data:/cache:ro:bad")]
+                )
+            ]
+        )
+
+        do {
+            _ = try ProjectConverter(log: log).convert(composeFile: composeFile, projectName: "p")
+            Issue.record("Expected malformed volume mount to fail conversion")
+        } catch let typedError as ContainerizationError {
+            #expect(typedError.code == .invalidArgument)
+            #expect(typedError.message.contains("Invalid volume mount 'data:/cache:ro:bad'"))
+        } catch {
+            Issue.record("Expected ContainerizationError, got \(error)")
+        }
     }
 
     @Test

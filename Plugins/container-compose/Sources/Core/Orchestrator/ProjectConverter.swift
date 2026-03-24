@@ -322,20 +322,27 @@ public struct ProjectConverter {
         }
         
         // Parse volumes (short and long form) with ~ expansion and Docker-compatible semantics for bare container paths
-        let volumes: [VolumeMount] = (service.volumes ?? []).compactMap { spec -> VolumeMount? in
+        let volumes: [VolumeMount] = try (service.volumes ?? []).map { spec -> VolumeMount in
             switch spec {
             case .string(let volumeString):
                 // Handle container-only anonymous volume: "/path"
                 if !volumeString.contains(":") {
-                    guard volumeString.hasPrefix("/") else { return nil }
+                    guard volumeString.hasPrefix("/") else {
+                        throw ContainerizationError(
+                            .invalidArgument,
+                            message: "Invalid volume mount '\(volumeString)' in service '\(name)'"
+                        )
+                    }
                     // Align with Docker Compose: a bare "/path" means an anonymous volume
                     // We leave source empty and mark type as .volume; Orchestrator will generate
                     // a deterministic name and ensure/create the backing volume.
                     return VolumeMount(source: "", target: volumeString, readOnly: false, type: .volume)
                 }
                 guard let mount = VolumeMount(from: volumeString) else {
-                    log.warning("Invalid volume mount '\(volumeString)' in service '\(name)'")
-                    return nil
+                    throw ContainerizationError(
+                        .invalidArgument,
+                        message: "Invalid volume mount '\(volumeString)' in service '\(name)'"
+                    )
                 }
                 return normalizeBindPathIfNeeded(mount)
             case .object(let obj):
@@ -388,14 +395,19 @@ public struct ProjectConverter {
                     } else {
                         url = projectDirectory.appendingPathComponent(path)
                     }
-                    // debug removed
-                    if FileManager.default.fileExists(atPath: url.path), let fileEnv = try? loadEnvFile(url: url, expansionEnvironment: service.envFileEnvironment) {
+                    if FileManager.default.fileExists(atPath: url.path) {
+                        let fileEnv = try loadEnvFile(url: url, expansionEnvironment: service.envFileEnvironment)
                         for (k, v) in fileEnv { environment[k] = v }
                         loaded = true
                         break
                     }
                 }
-                if !loaded { log.warning("env_file not found or unreadable: \(rawPath)") }
+                if !loaded {
+                    throw ContainerizationError(
+                        .notFound,
+                        message: "env_file not found or unreadable: \(rawPath)"
+                    )
+                }
             }
         }
         // Service-level environment overrides env_file

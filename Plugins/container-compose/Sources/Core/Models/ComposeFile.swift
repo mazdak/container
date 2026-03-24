@@ -452,13 +452,9 @@ public enum Environment: Codable {
     public init(from decoder: Decoder) throws {
         let container = try decoder.singleValueContainer()
         if let list = try? container.decode([String].self) {
-            // Validate keys in list form (handles quotes and inline comments)
+            // Validate keys in list form.
             for item in list {
-                var head = item
-                if let hash = head.firstIndex(of: "#") {
-                    head = String(head[..<hash])
-                }
-                let keyRaw = String(head.split(separator: "=", maxSplits: 1).first ?? "")
+                let keyRaw = String(item.split(separator: "=", maxSplits: 1).first ?? "")
                 let key = keyRaw.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: "'\"")))
                 if !key.isEmpty && !Environment.isValidName(key) {
                     throw DecodingError.dataCorruptedError(in: container, debugDescription: "Invalid environment variable name: '\(key)'")
@@ -493,15 +489,16 @@ public enum Environment: Codable {
         case .list(let list):
             var dict: [String: String] = [:]
             for item in list {
-                var head = item
-                if let hash = head.firstIndex(of: "#") {
-                    head = String(head[..<hash])
-                }
-                let parts = head.split(separator: "=", maxSplits: 1)
+                let parts = item.split(separator: "=", maxSplits: 1)
                 if parts.count == 2 {
                     let k = String(parts[0]).trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: "'\"")))
-                    let v = String(parts[1]).trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
+                    let v = String(parts[1])
                     dict[k] = v
+                } else if parts.count == 1 {
+                    let key = String(parts[0]).trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: "'\"")))
+                    if let value = ProcessInfo.processInfo.environment[key] {
+                        dict[key] = value
+                    }
                 }
             }
             return dict

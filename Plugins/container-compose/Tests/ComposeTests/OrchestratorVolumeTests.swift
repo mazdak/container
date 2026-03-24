@@ -233,4 +233,31 @@ struct OrchestratorVolumeTests {
 
         #expect(await fakePopulator.snapshotCalls().isEmpty)
     }
+
+    @Test
+    func testManagedVolumeNamesForRemovalIncludeImplicitNamedVolumes() {
+        let orch = Orchestrator(log: log)
+        let service = Service(
+            name: "db",
+            image: "postgres:16",
+            volumes: [
+                VolumeMount(source: "dbdata", target: "/var/lib/postgresql/data", type: .volume),
+                VolumeMount(source: "", target: "/cache", type: .volume),
+                VolumeMount(source: "externalvol", target: "/mnt/external", type: .volume),
+            ]
+        )
+        let project = Project(
+            name: "proj",
+            services: ["db": service],
+            networks: [:],
+            volumes: [
+                "declared": Volume(name: "declared"),
+                "externalvol": Volume(name: "externalvol", external: true),
+            ]
+        )
+
+        let names = orch.managedVolumeNamesForRemoval(project: project)
+
+        #expect(names == ["proj_dbdata", "proj_declared"])
+    }
 }

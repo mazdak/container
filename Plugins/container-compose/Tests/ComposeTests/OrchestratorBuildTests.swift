@@ -63,6 +63,29 @@ private actor RecordingProcess: ClientProcess {
     }
 }
 
+private actor HangingProcess: ClientProcess {
+    let id = UUID().uuidString
+    private var exitContinuation: CheckedContinuation<Int32, Error>?
+    private(set) var killedSignals: [Int32] = []
+
+    func start() async throws {}
+    func resize(_ size: Terminal.Size) async throws { _ = size }
+    func kill(_ signal: Int32) async throws {
+        killedSignals.append(signal)
+        exitContinuation?.resume(returning: 137)
+        exitContinuation = nil
+    }
+    func wait() async throws -> Int32 {
+        try await withCheckedThrowingContinuation { continuation in
+            exitContinuation = continuation
+        }
+    }
+
+    func snapshotKilledSignals() -> [Int32] {
+        killedSignals
+    }
+}
+
 private actor OrderedEvents {
     private(set) var events: [String] = []
 
@@ -164,6 +187,19 @@ struct OrchestratorBuildTests {
         )
 
         #expect(healthCheck.dependencyWaitTimeoutSeconds == 450)
+    }
+
+    @Test
+    func testHealthCheckWaitKillsProcessWhenTimeoutExpires() async throws {
+        let runner = DefaultHealthCheckRunner()
+        let process = HangingProcess()
+
+        await #expect(throws: DefaultHealthCheckRunner.TimeoutError.self) {
+            _ = try await runner.waitForHealthCheckExit(process: process, timeout: 0.01)
+        }
+
+        let killed = await process.snapshotKilledSignals()
+        #expect(killed == [SIGKILL])
     }
 
     @Test
@@ -318,6 +354,19 @@ struct OrchestratorBuildTests {
         #expect(runService.volumes.map(\.source) == baseService.volumes.map(\.source))
         #expect(runService.volumes.map(\.target) == baseService.volumes.map(\.target))
         #expect(runService.networks == baseService.networks)
+    }
+
+    @Test
+    func testProcessStdioDetachesBackgroundExecAndRun() {
+        let orchestrator = Orchestrator(log: log)
+
+        let detached = orchestrator.processStdio(detach: true, interactive: true, tty: true)
+        #expect(detached.allSatisfy { $0 == nil })
+
+        let attached = orchestrator.processStdio(detach: false, interactive: true, tty: false)
+        #expect(attached[0] != nil)
+        #expect(attached[1] === FileHandle.standardOutput)
+        #expect(attached[2] === FileHandle.standardError)
     }
 
     @Test
@@ -500,14 +549,12 @@ struct OrchestratorBuildTests {
             project: project,
             serviceName: "api",
             service: service,
-            imageName: "demo:api",
             configuration: runtimeConfig
         )
         let rawHash = orchestrator.configurationReuseHash(
             project: project,
             serviceName: "api",
             service: service,
-            imageName: "demo:api",
             configuration: rawConfig
         )
 
@@ -558,18 +605,59 @@ struct OrchestratorBuildTests {
             project: project,
             serviceName: "api",
             service: service,
-            imageName: "demo:api",
             configuration: baseConfig
         )
         let updatedHash = orchestrator.configurationReuseHash(
             project: project,
             serviceName: "api",
             service: service,
-            imageName: "demo:api",
             configuration: updatedConfig
         )
 
         #expect(baseHash != updatedHash)
+    }
+
+    @Test
+    func testConfigurationReuseHashIncludesResolvedImageIdentity() {
+        let orchestrator = Orchestrator(log: log)
+        let project = Project(name: "demo")
+        let service = Service(name: "api", image: "demo:api")
+
+        let baseImage = ImageDescription(
+            reference: "demo:api",
+            descriptor: Descriptor(
+                mediaType: "application/vnd.oci.image.index.v1+json",
+                digest: "sha256:old",
+                size: 1
+            )
+        )
+        let rebuiltImage = ImageDescription(
+            reference: "demo:api",
+            descriptor: Descriptor(
+                mediaType: "application/vnd.oci.image.index.v1+json",
+                digest: "sha256:new",
+                size: 1
+            )
+        )
+
+        let process = ProcessConfiguration(executable: "/bin/sh", arguments: [], environment: [])
+        let baseConfig = ContainerConfiguration(id: "demo_api", image: baseImage, process: process)
+        let rebuiltConfig = ContainerConfiguration(id: "demo_api", image: rebuiltImage, process: process)
+
+        let baseHash = orchestrator.configurationReuseHash(
+            project: project,
+            serviceName: "api",
+            service: service,
+            configuration: baseConfig
+        )
+        let rebuiltHash = orchestrator.configurationReuseHash(
+            project: project,
+            serviceName: "api",
+            service: service,
+            configuration: rebuiltConfig
+        )
+
+        #expect(baseHash != rebuiltHash)
     }
 
     @Test

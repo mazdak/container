@@ -17,6 +17,7 @@
 import Foundation
 import Testing
 import Logging
+import ContainerizationError
 @testable import ComposeCore
 
 struct EnvFileTests {
@@ -155,6 +156,33 @@ struct EnvFileTests {
         #expect(env["DATA_DIR"] == "")
         #expect(env["MAIN_GIT_DIR"]?.hasSuffix("/.git") == true)
     }
+
+    @Test
+    func testMissingServiceEnvFileFailsConversion() throws {
+        let fm = FileManager.default
+        let tempDir = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try fm.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: tempDir) }
+
+        let yaml = """
+        version: '3'
+        services:
+          app:
+            image: alpine
+            env_file:
+              - ./missing.env
+        """
+
+        let parser = ComposeParser(log: log)
+        let composeFile = try parser.parse(from: yaml.data(using: .utf8)!)
+
+        #expect(throws: ContainerizationError.self) {
+            _ = try ProjectConverter(log: log, projectDirectory: tempDir).convert(
+                composeFile: composeFile,
+                projectName: "test"
+            )
+        }
+    }
 }
 
 // Actor to safely capture log messages
@@ -171,9 +199,10 @@ actor LogCapture {
 }
 
 // Helper for testing log messages
-final class TestLogHandler: LogHandler {
+struct TestLogHandler: LogHandler {
     let label: String = "test"
     var logLevel: Logger.Level = .info
+    var metadataProvider: Logger.MetadataProvider?
     let capture: @Sendable (String) -> Void
 
     init(_ capture: @escaping @Sendable (String) -> Void) {

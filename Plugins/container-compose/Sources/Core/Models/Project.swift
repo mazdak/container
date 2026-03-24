@@ -272,11 +272,13 @@ public struct VolumeMount: Sendable {
         
         let source = String(components[0])
         let target = String(components[1])
+        guard target.hasPrefix("/") else { return nil }
         
         // Check for read-only flag
         var isReadOnly = false
         if components.count == 3 {
             let options = String(components[2])
+            guard !options.contains(":") else { return nil }
             isReadOnly = options.contains("ro")
         }
         

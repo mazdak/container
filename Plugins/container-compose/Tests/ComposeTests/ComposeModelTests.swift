@@ -92,14 +92,25 @@ struct ComposeModelTests {
 
     @Test
     func testEnvironmentLabelsDependsOnAndNetworkConversions() throws {
+        let passthroughKey = "COMPOSE_TEST_ENV_\(UUID().uuidString.replacingOccurrences(of: "-", with: "_"))"
+        setenv(passthroughKey, "from-process", 1)
+        defer { unsetenv(passthroughKey) }
+
         let environment = try JSONDecoder().decode(
             Environment.self,
-            from: Data(#"["FOO=bar","'QUOTED_KEY'=value # trailing comment","EMPTY"]"#.utf8)
+            from: Data(#"["FOO=bar","'QUOTED_KEY'=value # trailing comment","PASSWORD=abc#123"]"#.utf8)
         )
         #expect(environment.asDictionary == [
             "FOO": "bar",
-            "QUOTED_KEY": "value",
+            "QUOTED_KEY": "value # trailing comment",
+            "PASSWORD": "abc#123",
         ])
+
+        let passthroughEnvironment = try JSONDecoder().decode(
+            Environment.self,
+            from: Data("[\"\(passthroughKey)\"]".utf8)
+        )
+        #expect(passthroughEnvironment.asDictionary == [passthroughKey: "from-process"])
 
         let labels = try JSONDecoder().decode(
             Labels.self,
