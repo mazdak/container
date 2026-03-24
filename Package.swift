@@ -122,6 +122,12 @@ let package = Package(
                 "ContainerBuild"
             ]
         ),
+        .testTarget(
+            name: "ContainerCommandsTests",
+            dependencies: [
+                "ContainerCommands"
+            ]
+        ),
         .executableTarget(
             name: "container-apiserver",
             dependencies: [
