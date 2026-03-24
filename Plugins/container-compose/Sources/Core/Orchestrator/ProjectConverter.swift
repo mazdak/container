@@ -1,5 +1,5 @@
 //===----------------------------------------------------------------------===//
-// Copyright © 2025 Mazdak Rezvani and contributors. All rights reserved.
+// Copyright © 2026 Apple Inc. and the container project authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -409,7 +409,7 @@ public struct ProjectConverter {
             case .dict(let dict):
                 return (Array(dict.keys), dict.mapValues { $0.aliases ?? [] })
             case nil:
-                return (["default"], [:])
+                return ([], [:])
             }
         }()
         
@@ -666,11 +666,16 @@ public struct ProjectConverter {
                 return false
             }
         }()
+        let externalName: String? = {
+            if case .config(let cfg)? = volume.external { return cfg.name }
+            return volume.name
+        }()
         
         return Volume(
             name: name,
             driver: volume.driver ?? "local",
-            external: external
+            external: external,
+            externalName: externalName
         )
     }
     

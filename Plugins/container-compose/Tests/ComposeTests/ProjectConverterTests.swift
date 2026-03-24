@@ -1,5 +1,5 @@
 //===----------------------------------------------------------------------===//
-// Copyright © 2025 Mazdak Rezvani and contributors. All rights reserved.
+// Copyright © 2026 Apple Inc. and the container project authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -202,7 +202,26 @@ struct ProjectConverterTests {
 
         let backendService = try #require(project.services["backend"])
         #expect(backendService.networkMode == "bridge")
-        #expect(backendService.networks == ["default"])
+        #expect(backendService.networks.isEmpty)
+    }
+
+    @Test
+    func testConvertServiceWithoutNetworksKeepsDefaultNetworkImplicit() throws {
+        let yaml = """
+        version: '3'
+        services:
+          backend:
+            image: nginx:latest
+        """
+
+        let parser = ComposeParser(log: log)
+        let composeFile = try parser.parse(from: yaml.data(using: .utf8)!)
+
+        let converter = ProjectConverter(log: log)
+        let project = try converter.convert(composeFile: composeFile, projectName: "testapp")
+
+        let backendService = try #require(project.services["backend"])
+        #expect(backendService.networks.isEmpty)
     }
 
     @Test
@@ -266,6 +285,30 @@ struct ProjectConverterTests {
         #expect(svc.volumes[0].type == .volume)
         #expect(svc.volumes[0].source.isEmpty)
         #expect(svc.volumes[0].target == "/cache")
+    }
+
+    @Test
+    func testConvertVolumePreservesExplicitComposeName() throws {
+        let yaml = """
+        version: '3'
+        services:
+          svc:
+            image: alpine
+            volumes:
+              - cache:/cache
+        volumes:
+          cache:
+            name: my-cache-volume
+        """
+
+        let parser = ComposeParser(log: log)
+        let composeFile = try parser.parse(from: yaml.data(using: .utf8)!)
+        let project = try ProjectConverter(log: log).convert(composeFile: composeFile, projectName: "test")
+        let volume = try #require(project.volumes["cache"])
+
+        #expect(volume.name == "cache")
+        #expect(volume.externalName == "my-cache-volume")
+        #expect(!volume.external)
     }
 
     @Test

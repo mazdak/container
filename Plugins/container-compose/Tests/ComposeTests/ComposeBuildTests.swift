@@ -1,5 +1,5 @@
 //===----------------------------------------------------------------------===//
-// Copyright © 2025 Mazdak Rezvani and contributors. All rights reserved.
+// Copyright © 2026 Apple Inc. and the container project authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -61,6 +61,31 @@ struct ComposeBuildTests {
         #expect(throws: Error.self) {
             _ = try command.buildPlan(project: project, selectedServices: ["missing"])
         }
+    }
+
+    @Test
+    func testBuildArgumentsUseEffectiveImageNameForBuildOnlyService() throws {
+        let command = try ComposeBuild.parse([])
+        let service = Service(
+            name: "backend",
+            build: BuildConfig(
+                context: ".",
+                dockerfile: "Dockerfile",
+                args: ["NODE_ENV": "development"],
+                target: "dev"
+            )
+        )
+
+        let arguments = command.buildArguments(for: service, projectName: "demo")
+
+        #expect(arguments == [
+            "build",
+            "--tag", service.effectiveImageName(projectName: "demo"),
+            "--file", "Dockerfile",
+            "--target", "dev",
+            "--build-arg", "NODE_ENV=development",
+            ".",
+        ])
     }
 
     @Test

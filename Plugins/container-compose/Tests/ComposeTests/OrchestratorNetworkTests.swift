@@ -1,5 +1,17 @@
 //===----------------------------------------------------------------------===//
-// Copyright © 2025 Mazdak Rezvani
+// Copyright © 2026 Apple Inc. and the container project authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//   https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 //===----------------------------------------------------------------------===//
 
 import Testing
@@ -35,6 +47,20 @@ struct OrchestratorNetworkTests {
         let proj = Project(name: "demo", services: ["api": svc], networks: nets, volumes: [:])
         let ids = try orch.mapServiceNetworkIds(project: proj, service: svc)
         #expect(ids == ["corp-net"]) // external uses literal name
+    }
+
+    @Test
+    func testMapServiceNetworkIds_usesCustomNonExternalName() throws {
+        let orch = Orchestrator(log: log)
+        let nets: [String: Network] = [
+            "default": Network(name: "default", driver: "bridge", external: false, externalName: "corp-net")
+        ]
+        let svc = Service(name: "api", image: "alpine", networks: ["default"])
+        let proj = Project(name: "demo", services: ["api": svc], networks: nets, volumes: [:])
+
+        let ids = try orch.mapServiceNetworkIds(project: proj, service: svc)
+
+        #expect(ids == ["corp-net"])
     }
 
     @Test
@@ -153,6 +179,208 @@ struct OrchestratorNetworkTests {
                 ipAddress: "192.168.66.27",
                 hostnames: ["aws", "localstack"]
             )
+        ])
+    }
+
+    @Test
+    func testComposePeerHostsUsesImplicitDefaultNetwork() throws {
+        let orch = Orchestrator(log: log)
+        let app = Service(name: "app", image: "demo:app")
+        let db = Service(name: "db", image: "postgres:16")
+        let project = Project(
+            name: "demo",
+            services: ["app": app, "db": db],
+            networks: ["default": Network(name: "default", driver: "bridge", external: false)],
+            volumes: [:]
+        )
+
+        let dbConfig = ContainerConfiguration(
+            id: "demo_db",
+            image: ImageDescription(
+                reference: "postgres:16",
+                descriptor: Descriptor(
+                    mediaType: "application/vnd.oci.image.index.v1+json",
+                    digest: "sha256:test",
+                    size: 1
+                )
+            ),
+            process: ProcessConfiguration(executable: "/bin/sh", arguments: [], environment: [])
+        )
+        var labeled = dbConfig
+        labeled.labels = [
+            "com.apple.compose.project": "demo",
+            "com.apple.compose.service": "db",
+        ]
+
+        let dbSnapshot = ContainerSnapshot(
+            configuration: labeled,
+            status: .running,
+            networks: [
+                Attachment(
+                    network: "default",
+                    hostname: "demo_db",
+                    ipv4Address: try CIDRv4("192.168.68.12/24"),
+                    ipv4Gateway: try IPv4Address("192.168.68.1"),
+                    ipv6Address: nil,
+                    macAddress: nil
+                )
+            ]
+        )
+
+        let hosts = try orch.composePeerHosts(
+            project: project,
+            serviceName: "app",
+            service: app,
+            containers: [dbSnapshot]
+        )
+
+        #expect(hosts == [
+            ContainerConfiguration.HostEntry(
+                ipAddress: "192.168.68.12",
+                hostnames: ["db"]
+            )
+        ])
+    }
+
+    @Test
+    func testComposePeerHostsIncludesAliasesFromEverySharedNetwork() throws {
+        let orch = Orchestrator(log: log)
+        let backend = Service(
+            name: "backend",
+            image: "demo:dev",
+            networks: ["frontend", "backend"]
+        )
+        let api = Service(
+            name: "api",
+            image: "demo:dev",
+            networks: ["frontend", "backend"],
+            networkAliases: [
+                "frontend": ["public-api"],
+                "backend": ["internal-api"],
+            ]
+        )
+        let project = Project(
+            name: "demo",
+            services: ["backend": backend, "api": api],
+            networks: [
+                "frontend": Network(name: "frontend", driver: "bridge", external: false),
+                "backend": Network(name: "backend", driver: "bridge", external: false),
+            ],
+            volumes: [:]
+        )
+
+        let apiConfig = ContainerConfiguration(
+            id: "demo-api",
+            image: ImageDescription(
+                reference: "demo:api",
+                descriptor: Descriptor(
+                    mediaType: "application/vnd.oci.image.index.v1+json",
+                    digest: "sha256:test",
+                    size: 1
+                )
+            ),
+            process: ProcessConfiguration(executable: "/bin/sh", arguments: [], environment: [])
+        )
+        var labeled = apiConfig
+        labeled.labels = [
+            "com.apple.compose.project": "demo",
+            "com.apple.compose.service": "api",
+        ]
+
+        let apiSnapshot = ContainerSnapshot(
+            configuration: labeled,
+            status: .running,
+            networks: [
+                Attachment(
+                    network: "demo_frontend",
+                    hostname: "demo-api",
+                    ipv4Address: try CIDRv4("192.168.80.10/24"),
+                    ipv4Gateway: try IPv4Address("192.168.80.1"),
+                    ipv6Address: nil,
+                    macAddress: nil
+                ),
+                Attachment(
+                    network: "demo_backend",
+                    hostname: "demo-api",
+                    ipv4Address: try CIDRv4("192.168.81.10/24"),
+                    ipv4Gateway: try IPv4Address("192.168.81.1"),
+                    ipv6Address: nil,
+                    macAddress: nil
+                ),
+            ]
+        )
+
+        let hosts = try orch.composePeerHosts(
+            project: project,
+            serviceName: "backend",
+            service: backend,
+            containers: [apiSnapshot]
+        )
+
+        #expect(hosts == [
+            ContainerConfiguration.HostEntry(
+                ipAddress: "192.168.80.10",
+                hostnames: ["api", "public-api"]
+            ),
+            ContainerConfiguration.HostEntry(
+                ipAddress: "192.168.81.10",
+                hostnames: ["api", "internal-api"]
+            ),
+        ])
+    }
+
+    @Test
+    func testPlannedComposeNetworkAttachmentsIncludeImplicitDefaultNetwork() throws {
+        let orch = Orchestrator(log: log)
+        let service = Service(name: "db", image: "postgres:16")
+        let project = Project(
+            name: "demo",
+            services: ["db": service],
+            networks: ["default": Network(name: "default", driver: "bridge", external: false)],
+            volumes: [:]
+        )
+
+        let attachments = try orch.plannedComposeNetworkAttachments(
+            project: project,
+            serviceName: "db",
+            service: service
+        )
+
+        #expect(attachments.keys.sorted() == ["default"])
+        #expect(attachments["default"]?.network == "default")
+        #expect(attachments["default"]?.options.hostname == "demo_db")
+    }
+
+    @Test
+    func testComposePeerHostsIncludesPlannedStartupPeers() {
+        let orch = Orchestrator(log: log)
+
+        let hosts = orch.composePeerHosts(
+            plannedAttachments: [
+                Orchestrator.ComposePeerAttachment(
+                    serviceName: "aws",
+                    networkName: "resq-network",
+                    ipAddress: "192.168.66.27",
+                    aliases: ["localstack"]
+                ),
+                Orchestrator.ComposePeerAttachment(
+                    serviceName: "postgres",
+                    networkName: "resq-network",
+                    ipAddress: "192.168.66.39",
+                    aliases: []
+                ),
+            ]
+        )
+
+        #expect(hosts == [
+            ContainerConfiguration.HostEntry(
+                ipAddress: "192.168.66.27",
+                hostnames: ["aws", "localstack"]
+            ),
+            ContainerConfiguration.HostEntry(
+                ipAddress: "192.168.66.39",
+                hostnames: ["postgres"]
+            ),
         ])
     }
 

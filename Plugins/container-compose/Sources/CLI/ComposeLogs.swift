@@ -1,5 +1,5 @@
 //===----------------------------------------------------------------------===//
-// Copyright © 2025 Mazdak Rezvani and contributors. All rights reserved.
+// Copyright © 2026 Apple Inc. and the container project authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -101,10 +101,10 @@ struct ComposeLogs: AsyncParsableCommand {
             if !noLogPrefix {
                 output += LogPrefixFormatter.coloredPrefix(for: entry.containerName, width: nameWidth, colorEnabled: !noColor)
             }
-            if timestamps {
+            if timestamps, let timestamp = entry.timestamp {
                 // If no prefix, don't double space
                 if !output.isEmpty { output += " " }
-                output += dateFormatter.string(from: entry.timestamp)
+                output += dateFormatter.string(from: timestamp)
             }
             if !output.isEmpty { output += " " }
             output += entry.message

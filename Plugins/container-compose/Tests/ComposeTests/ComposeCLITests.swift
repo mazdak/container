@@ -1,5 +1,5 @@
 //===----------------------------------------------------------------------===//
-// Copyright © 2025 Mazdak Rezvani and contributors. All rights reserved.
+// Copyright © 2026 Apple Inc. and the container project authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -412,7 +412,7 @@ struct ComposeCLITests {
     }
 
     @Test
-    func testValidateAllowsAnchorsByDefault() throws {
+    func testValidateRejectsAnchorsByDefault() throws {
         let dir = try ComposeCLITestSupport.makeTempDir()
         defer { try? FileManager.default.removeItem(at: dir) }
 
@@ -426,6 +426,28 @@ struct ComposeCLITests {
         """.write(to: composeURL, atomically: true, encoding: .utf8)
 
         let result = try ComposeCLITestSupport.run(arguments: ["validate", "-f", composeURL.path, "--quiet"], currentDirectory: dir)
+        #expect(result.status != 0)
+        #expect(result.stderr.contains("anchors"))
+    }
+
+    @Test
+    func testValidateAllowsAnchorsWithRootFlag() throws {
+        let dir = try ComposeCLITestSupport.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let composeURL = dir.appendingPathComponent("docker-compose.yml")
+        try """
+        x-common: &common
+          image: nginx:alpine
+        services:
+          web:
+            <<: *common
+        """.write(to: composeURL, atomically: true, encoding: .utf8)
+
+        let result = try ComposeCLITestSupport.run(
+            arguments: ["--allow-anchors", "validate", "-f", composeURL.path, "--quiet"],
+            currentDirectory: dir
+        )
         #expect(result.status == 0)
     }
 

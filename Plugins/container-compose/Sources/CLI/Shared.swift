@@ -1,5 +1,5 @@
 //===----------------------------------------------------------------------===//
-// Copyright © 2025 Mazdak Rezvani and contributors. All rights reserved.
+// Copyright © 2026 Apple Inc. and the container project authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -55,4 +55,22 @@ func installDefaultTerminationHandlers(onSignal: (@Sendable () -> Void)? = nil) 
     }
     install(SIGINT)
     install(SIGTERM)
+}
+
+struct AttachedTerminalOptions: Equatable {
+    let interactive: Bool
+    let tty: Bool
+}
+
+func resolveAttachedTerminalOptions(
+    detach: Bool,
+    interactiveFlag: Bool,
+    ttyFlag: Bool,
+    noTty: Bool,
+    stdinIsTTY: Bool = isatty(STDIN_FILENO) == 1,
+    stdoutIsTTY: Bool = isatty(STDOUT_FILENO) == 1
+) -> AttachedTerminalOptions {
+    let interactive = interactiveFlag || !detach
+    let tty = !noTty && (ttyFlag || (!detach && stdinIsTTY && stdoutIsTTY))
+    return AttachedTerminalOptions(interactive: interactive, tty: tty)
 }

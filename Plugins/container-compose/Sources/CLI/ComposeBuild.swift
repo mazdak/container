@@ -1,5 +1,5 @@
 //===----------------------------------------------------------------------===//
-// Copyright © 2025 Mazdak Rezvani and contributors. All rights reserved.
+// Copyright © 2026 Apple Inc. and the container project authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -63,25 +63,7 @@ struct ComposeBuild: AsyncParsableCommand {
         }
 
         for service in plan {
-            guard let build = service.build else { continue }
-            var arguments = [
-                "build",
-                "--tag", service.image ?? "\(project.name)-\(service.name)",
-            ]
-            if let dockerfile = build.dockerfile, !dockerfile.isEmpty {
-                arguments += ["--file", dockerfile]
-            }
-            if let target = build.target, !target.isEmpty {
-                arguments += ["--target", target]
-            }
-            if noCache {
-                arguments.append("--no-cache")
-            }
-            if pull {
-                arguments.append("--pull")
-            }
-            arguments += (build.args ?? [:]).sorted { $0.key < $1.key }.flatMap { ["--build-arg", "\($0.key)=\($0.value)"] }
-            arguments.append(build.context ?? ".")
+            let arguments = buildArguments(for: service, projectName: project.name)
 
             var command = try Application.parseAsRoot(arguments)
             if var asyncCommand = command as? AsyncParsableCommand {
@@ -138,5 +120,31 @@ struct ComposeBuild: AsyncParsableCommand {
         }
 
         return result
+    }
+
+    internal func buildArguments(for service: Service, projectName: String) -> [String] {
+        guard let build = service.build else { return [] }
+
+        var arguments = [
+            "build",
+            "--tag", service.effectiveImageName(projectName: projectName),
+        ]
+
+        if let dockerfile = build.dockerfile, !dockerfile.isEmpty {
+            arguments += ["--file", dockerfile]
+        }
+        if let target = build.target, !target.isEmpty {
+            arguments += ["--target", target]
+        }
+        if noCache {
+            arguments.append("--no-cache")
+        }
+        if pull {
+            arguments.append("--pull")
+        }
+        arguments += (build.args ?? [:]).sorted { $0.key < $1.key }.flatMap { ["--build-arg", "\($0.key)=\($0.value)"] }
+        arguments.append(build.context ?? ".")
+
+        return arguments
     }
 }

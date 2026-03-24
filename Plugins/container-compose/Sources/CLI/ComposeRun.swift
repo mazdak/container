@@ -1,5 +1,5 @@
 //===----------------------------------------------------------------------===//
-// Copyright © 2025 Mazdak Rezvani and contributors. All rights reserved.
+// Copyright © 2026 Apple Inc. and the container project authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -87,13 +87,19 @@ struct ComposeRun: AsyncParsableCommand {
         }
 
         let orchestrator = Orchestrator(log: log)
+        let terminal = resolveAttachedTerminalOptions(
+            detach: detach,
+            interactiveFlag: interactive,
+            ttyFlag: tty,
+            noTty: noTty
+        )
         let exitCode = try await orchestrator.run(
             project: project,
             serviceName: service,
             command: command,
             detach: detach,
-            interactive: interactive,
-            tty: noTty ? false : tty,
+            interactive: terminal.interactive,
+            tty: terminal.tty,
             user: user,
             workdir: workdir,
             environment: envVars,

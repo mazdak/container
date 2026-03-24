@@ -1,5 +1,5 @@
 //===----------------------------------------------------------------------===//
-// Copyright © 2025 Mazdak Rezvani and contributors. All rights reserved.
+// Copyright © 2026 Apple Inc. and the container project authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,6 +17,7 @@
 import ArgumentParser
 import Foundation
 import ContainerNetworkService
+import ContainerNetworkServiceClient
 import CryptoKit
 import ContainerAPIClient
 import ContainerCommands
@@ -39,6 +40,39 @@ import Glibc
 fileprivate final class ExecSignalRetainer {
     private static var sources: [DispatchSourceSignal] = []
     static func retain(_ src: DispatchSourceSignal) { sources.append(src) }
+}
+
+actor BuildOutputCaptureLock {
+    static let shared = BuildOutputCaptureLock()
+
+    private var locked = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func withLock<T>(_ operation: () async throws -> T) async rethrows -> T {
+        await acquire()
+        defer { release() }
+        return try await operation()
+    }
+
+    private func acquire() async {
+        guard locked else {
+            locked = true
+            return
+        }
+
+        await withCheckedContinuation { continuation in
+            waiters.append(continuation)
+        }
+    }
+
+    private func release() {
+        if waiters.isEmpty {
+            locked = false
+            return
+        }
+
+        waiters.removeFirst().resume()
+    }
 }
 
 // MARK: - HealthCheckRunner
@@ -231,28 +265,6 @@ public struct DefaultBuildService: BuildService {
             .setTasks(0)
         ])
 
-        let stdoutPipe = Pipe()
-        let stderrPipe = Pipe()
-
-        let stdoutFD = FileHandle.standardOutput.fileDescriptor
-        let stderrFD = FileHandle.standardError.fileDescriptor
-
-        let stdoutBackup = dup(stdoutFD)
-        let stderrBackup = dup(stderrFD)
-
-        guard stdoutBackup != -1, stderrBackup != -1 else {
-            throw ContainerizationError(
-                .internalError,
-                message: "Failed to duplicate standard IO descriptors for build"
-            )
-        }
-
-        fflush(stdout)
-        fflush(stderr)
-
-        dup2(stdoutPipe.fileHandleForWriting.fileDescriptor, stdoutFD)
-        dup2(stderrPipe.fileHandleForWriting.fileDescriptor, stderrFD)
-
         func forwardOutput(from handle: FileHandle, prefix: String) -> Task<Void, Never> {
             Task {
                 var buffer = Data()
@@ -299,48 +311,72 @@ public struct DefaultBuildService: BuildService {
             return events
         }
 
-        let stdoutTask = forwardOutput(from: stdoutPipe.fileHandleForReading, prefix: "build")
-        let stderrTask = forwardOutput(from: stderrPipe.fileHandleForReading, prefix: "build")
+        try await BuildOutputCaptureLock.shared.withLock {
+            let stdoutPipe = Pipe()
+            let stderrPipe = Pipe()
 
-        var encounteredError: Error?
-        do {
-            try await command.run()
-        } catch {
-            encounteredError = error
-        }
+            let stdoutFD = FileHandle.standardOutput.fileDescriptor
+            let stderrFD = FileHandle.standardError.fileDescriptor
 
-        fflush(stdout)
-        fflush(stderr)
+            let stdoutBackup = dup(stdoutFD)
+            let stderrBackup = dup(stderrFD)
 
-        dup2(stdoutBackup, stdoutFD)
-        dup2(stderrBackup, stderrFD)
-        close(stdoutBackup)
-        close(stderrBackup)
+            guard stdoutBackup != -1, stderrBackup != -1 else {
+                throw ContainerizationError(
+                    .internalError,
+                    message: "Failed to duplicate standard IO descriptors for build"
+                )
+            }
 
-        stdoutPipe.fileHandleForWriting.closeFile()
-        stderrPipe.fileHandleForWriting.closeFile()
+            fflush(stdout)
+            fflush(stderr)
 
-        await stdoutTask.value
-        await stderrTask.value
+            dup2(stdoutPipe.fileHandleForWriting.fileDescriptor, stdoutFD)
+            dup2(stderrPipe.fileHandleForWriting.fileDescriptor, stderrFD)
 
-        stdoutPipe.fileHandleForReading.closeFile()
-        stderrPipe.fileHandleForReading.closeFile()
+            let stdoutTask = forwardOutput(from: stdoutPipe.fileHandleForReading, prefix: "build")
+            let stderrTask = forwardOutput(from: stderrPipe.fileHandleForReading, prefix: "build")
 
-        if let error = encounteredError {
+            var encounteredError: Error?
+            do {
+                try await command.run()
+            } catch {
+                encounteredError = error
+            }
+
+            fflush(stdout)
+            fflush(stderr)
+
+            dup2(stdoutBackup, stdoutFD)
+            dup2(stderrBackup, stderrFD)
+            close(stdoutBackup)
+            close(stderrBackup)
+
+            stdoutPipe.fileHandleForWriting.closeFile()
+            stderrPipe.fileHandleForWriting.closeFile()
+
+            await stdoutTask.value
+            await stderrTask.value
+
+            stdoutPipe.fileHandleForReading.closeFile()
+            stderrPipe.fileHandleForReading.closeFile()
+
+            if let error = encounteredError {
+                await handler([
+                    .custom("Build failed for \(serviceName): \(error.localizedDescription)")
+                ])
+                throw ContainerizationError(
+                    .internalError,
+                    message: "Failed to build image for service '\(serviceName)': \(error.localizedDescription)"
+                )
+            }
+
             await handler([
-                .custom("Build failed for \(serviceName): \(error.localizedDescription)")
+                .setSubDescription("Built image \(imageName)"),
+                .addTasks(1),
+                .custom("Build completed for \(serviceName)")
             ])
-            throw ContainerizationError(
-                .internalError,
-                message: "Failed to build image for service '\(serviceName)': \(error.localizedDescription)"
-            )
         }
-
-        await handler([
-            .setSubDescription("Built image \(imageName)"),
-            .addTasks(1),
-            .custom("Build completed for \(serviceName)")
-        ])
     }
 }
 
@@ -544,6 +580,8 @@ public actor Orchestrator {
     private let volumeClient: VolumeClient
     private let volumePopulator: VolumePopulator
     private var buildCache: [String: String] = [:] // Cache key -> image name
+    private var activeStartupServices: [String: Service] = [:]
+    private var composeHostReservations: [String: Set<ComposeHostReservation>] = [:]
 
     /// State of a project
     private struct ProjectState {
@@ -567,6 +605,24 @@ public actor Orchestrator {
         let containerID: String
         let containerName: String
         var status: ContainerStatus
+    }
+
+    private struct ComposeHostReservation: Hashable, Sendable {
+        let networkId: String
+        let hostname: String
+        let plugin: String
+    }
+
+    internal struct ComposePeerAttachment: Sendable {
+        let serviceName: String
+        let networkName: String
+        let ipAddress: String
+        let aliases: [String]
+    }
+
+    enum ExistingContainerResolution {
+        case createNew
+        case reuse(ContainerSnapshot)
     }
 
     /// Service status information
@@ -603,14 +659,14 @@ public actor Orchestrator {
         public let containerName: String
         public let message: String
         public let stream: LogStream
-        public let timestamp: Date
+        public let timestamp: Date?
 
         public enum LogStream: Sendable {
             case stdout
             case stderr
         }
 
-        public init(serviceName: String, containerName: String, message: String, stream: LogStream, timestamp: Date = Date()) {
+        public init(serviceName: String, containerName: String, message: String, stream: LogStream, timestamp: Date? = nil) {
             self.serviceName = serviceName
             self.containerName = containerName
             self.message = message
@@ -715,17 +771,26 @@ public actor Orchestrator {
         }
 
         // Create and start containers for services
-        try await createAndStartContainers(
-            project: project,
-            services: targetServices,
-            detach: detach,
-            forceRecreate: forceRecreate,
-            noRecreate: noRecreate,
-            removeOnExit: removeOnExit,
-            progressHandler: progressHandler,
-            pullPolicy: pullPolicy,
-            disableHealthcheck: disableHealthcheck
-        )
+        do {
+            try await createAndStartContainers(
+                project: project,
+                services: targetServices,
+                detach: detach,
+                forceRecreate: forceRecreate,
+                noRecreate: noRecreate,
+                noDeps: noDeps,
+                removeOnExit: removeOnExit,
+                progressHandler: progressHandler,
+                pullPolicy: pullPolicy,
+                disableHealthcheck: disableHealthcheck
+            )
+        } catch {
+            await releaseTrackedComposeHostReservations()
+            activeStartupServices = [:]
+            throw error
+        }
+        activeStartupServices = [:]
+        composeHostReservations = [:]
 
         // If --wait is set, wait for selected services to be healthy/running
         if wait {
@@ -794,28 +859,49 @@ public actor Orchestrator {
         detach: Bool,
         forceRecreate: Bool,
         noRecreate: Bool,
+        noDeps: Bool,
         removeOnExit: Bool,
         progressHandler: ProgressUpdateHandler?,
         pullPolicy: PullPolicy,
         disableHealthcheck: Bool
     ) async throws {
+        let startupServices = resolvedStartupServices(services: services, noDeps: noDeps)
+        activeStartupServices = startupServices
+
+        let plannedNetworkRefreshServices = try await plannedComposeNetworkRefreshServices(
+            project: project,
+            services: startupServices,
+            forceRecreate: forceRecreate,
+            noRecreate: noRecreate
+        )
+        for serviceName in plannedNetworkRefreshServices.sorted() {
+            guard let service = startupServices[serviceName] else { continue }
+            let containerId = service.containerName ?? "\(project.name)_\(serviceName)"
+            guard let existing = try? await findRuntimeContainer(byId: containerId) else { continue }
+            try await deleteExistingContainer(
+                projectName: project.name,
+                serviceName: serviceName,
+                existing: existing
+            )
+        }
+
         // Sort services by dependencies
-        let resolution = try DependencyResolver.resolve(services: services)
+        let resolution = try DependencyResolver.resolve(services: startupServices)
         let sortedServices = resolution.startOrder
 
         for serviceName in sortedServices {
-            guard let service = services[serviceName] else { continue }
+            guard let service = startupServices[serviceName] else { continue }
 
             do {
                 // Wait for dependency conditions before starting this service
-                try await waitForDependencyConditions(project: project, serviceName: serviceName, services: services, disableHealthcheck: disableHealthcheck)
+                try await waitForDependencyConditions(project: project, serviceName: serviceName, services: startupServices, disableHealthcheck: disableHealthcheck)
 
                 try await createAndStartContainer(
                     project: project,
                     serviceName: serviceName,
                     service: service,
                     detach: detach,
-                    forceRecreate: forceRecreate,
+                    forceRecreate: forceRecreate || plannedNetworkRefreshServices.contains(serviceName),
                     noRecreate: noRecreate,
                     removeOnExit: removeOnExit,
                     progressHandler: progressHandler,
@@ -829,6 +915,94 @@ public actor Orchestrator {
                 throw error
             }
         }
+    }
+
+    nonisolated internal func resolvedStartupServices(services: [String: Service], noDeps: Bool) -> [String: Service] {
+        guard noDeps else { return services }
+        return DependencyResolver.scopeToSelection(services: services)
+    }
+
+    private func plannedComposeNetworkRefreshServices(
+        project: Project,
+        services: [String: Service],
+        forceRecreate: Bool,
+        noRecreate: Bool
+    ) async throws -> Set<String> {
+        guard !noRecreate else {
+            return []
+        }
+
+        var refreshSeeds = Set<String>()
+        if forceRecreate {
+            refreshSeeds.formUnion(
+                services.compactMap { name, service in
+                    composeNetworkNames(for: service).isEmpty ? nil : name
+                }
+            )
+        }
+
+        for (serviceName, service) in services where !composeNetworkNames(for: service).isEmpty {
+            let containerId = service.containerName ?? "\(project.name)_\(serviceName)"
+            guard let existing = try? await findRuntimeContainer(byId: containerId) else {
+                refreshSeeds.insert(serviceName)
+                continue
+            }
+
+            guard !forceRecreate else { continue }
+
+            let imageName = service.effectiveImageName(projectName: project.name)
+            let currentHash = existing.configuration.labels["com.apple.container.compose.config-hash"]
+            do {
+                let expectedHash = try await expectedConfigurationHash(
+                    project: project,
+                    serviceName: serviceName,
+                    service: service,
+                    imageName: imageName,
+                    removeOnExit: false
+                )
+                if currentHash != expectedHash {
+                    refreshSeeds.insert(serviceName)
+                }
+            } catch {
+                refreshSeeds.insert(serviceName)
+            }
+        }
+
+        return expandedComposeNetworkRefreshServices(
+            services: services,
+            seeds: refreshSeeds
+        )
+    }
+
+    nonisolated internal func expandedComposeNetworkRefreshServices(
+        services: [String: Service],
+        seeds: Set<String>
+    ) -> Set<String> {
+        guard !seeds.isEmpty else {
+            return []
+        }
+
+        var expanded = seeds
+        var pending = Array(seeds)
+
+        while let current = pending.popLast() {
+            guard let service = services[current] else {
+                continue
+            }
+            let currentNetworks = Set(composeNetworkNames(for: service))
+            guard !currentNetworks.isEmpty else {
+                continue
+            }
+            for (peerName, peerService) in services where !expanded.contains(peerName) {
+                guard !currentNetworks.isDisjoint(with: Set(composeNetworkNames(for: peerService))) else {
+                    continue
+                }
+                expanded.insert(peerName)
+                pending.append(peerName)
+            }
+        }
+
+        return expanded
     }
 
     /// Wait for dependencies according to compose depends_on conditions
@@ -952,7 +1126,7 @@ public actor Orchestrator {
         let containerId = service.containerName ?? "\(project.name)_\(serviceName)"
 
         // Handle existing container logic
-        try await handleExistingContainer(
+        let existingResolution = try await handleExistingContainer(
             project: project,
             serviceName: serviceName,
             service: service,
@@ -960,6 +1134,21 @@ public actor Orchestrator {
             forceRecreate: forceRecreate,
             noRecreate: noRecreate
         )
+
+        switch existingResolution {
+        case .reuse(let existing):
+            try await reuseExistingContainer(
+                project: project,
+                serviceName: serviceName,
+                service: service,
+                containerId: containerId,
+                existing: existing
+            )
+            consumeTrackedComposeHostReservations(for: serviceName)
+            return
+        case .createNew:
+            break
+        }
 
         // Ensure image is available for build services
         let imageName = service.effectiveImageName(projectName: project.name)
@@ -975,6 +1164,7 @@ public actor Orchestrator {
             removeOnExit: removeOnExit,
             progressHandler: progressHandler
         )
+        consumeTrackedComposeHostReservations(for: serviceName)
     }
 
     /// Handle existing container logic (reuse, recreate, or skip)
@@ -985,82 +1175,144 @@ public actor Orchestrator {
         containerId: String,
         forceRecreate: Bool,
         noRecreate: Bool
-    ) async throws {
+    ) async throws -> ExistingContainerResolution {
         guard let existing = try? await findRuntimeContainer(byId: containerId) else {
-            return // No existing container, proceed with creation
+            return .createNew
         }
 
         if noRecreate {
             log.info("Reusing existing container '\(existing.id)' for service '\(serviceName)' (no-recreate)")
-            // Track in state if missing
-            if projectState[project.name]?.containers[serviceName] == nil {
-                projectState[project.name]?.containers[serviceName] = ContainerState(
-                    serviceName: serviceName,
-                    containerID: existing.id,
-                    containerName: containerId,
-                    status: .starting
-                )
-            }
-            return
+            return .reuse(existing)
         }
 
         if !forceRecreate {
             // Check if configuration has changed
             let imageName = service.effectiveImageName(projectName: project.name)
-            let expectedHash = computeConfigHash(
-                project: project,
-                serviceName: serviceName,
-                service: service,
-                imageName: imageName,
-                process: ProcessConfiguration(
-                    executable: service.command?.first ?? "/bin/sh",
-                    arguments: Array((service.command ?? ["/bin/sh", "-c"]).dropFirst()),
-                    environment: service.environment.map { "\($0.key)=\($0.value)" },
-                    workingDirectory: service.workingDir ?? "/"
-                ),
-                ports: try service.ports.map { port in
-                    try Parser.publishPort(publishSpec(from: port))
-                },
-                mounts: service.volumes.map { v in
-                    switch v.type {
-                    case .bind:
-                        return Filesystem.virtiofs(source: v.source, destination: v.target, options: v.readOnly ? ["ro"] : [])
-                    case .volume:
-                        return Filesystem.volume(name: v.source, format: "ext4", source: v.source, destination: v.target, options: v.readOnly ? ["ro"] : [], cache: .auto, sync: .full)
-                    case .tmpfs:
-                        return Filesystem.tmpfs(destination: v.target, options: v.readOnly ? ["ro"] : [])
-                    }
-                }
-            )
             let currentHash = existing.configuration.labels["com.apple.container.compose.config-hash"]
-            if currentHash == expectedHash {
-                log.info("Reusing existing container '\(existing.id)' for service '\(serviceName)' (config unchanged)")
-                return
+            do {
+                let expectedHash = try await expectedConfigurationHash(
+                    project: project,
+                    serviceName: serviceName,
+                    service: service,
+                    imageName: imageName,
+                    removeOnExit: false
+                )
+                if currentHash == expectedHash {
+                    log.info("Reusing existing container '\(existing.id)' for service '\(serviceName)' (config unchanged)")
+                    return .reuse(existing)
+                }
+            } catch {
+                log.warning("Failed to compute reuse hash for service '\(serviceName)'; recreating container: \(error)")
             }
         }
 
-        // Recreate the container
+        try await deleteExistingContainer(
+            projectName: project.name,
+            serviceName: serviceName,
+            existing: existing
+        )
+        return .createNew
+    }
+
+    private func deleteExistingContainer(
+        projectName: String,
+        serviceName: String,
+        existing: ContainerSnapshot
+    ) async throws {
         log.info("Recreating existing container '\(existing.id)' for service '\(serviceName)'")
-        // 1) Ask it to stop gracefully (SIGTERM) with longer timeout
-        do { try await containerClient.stop(id: existing.id, opts: ContainerStopOptions(timeoutInSeconds: 15, signal: SIGTERM)) }
-        catch { log.warning("failed to stop \(existing.id): \(error)") }
-        // 2) Wait until it is actually stopped; if not, escalate to SIGKILL and wait briefly
+        do {
+            try await containerClient.stop(id: existing.id, opts: ContainerStopOptions(timeoutInSeconds: 15, signal: SIGTERM))
+        } catch {
+            log.warning("failed to stop \(existing.id): \(error)")
+        }
         do {
             try await waitUntilContainerStopped(containerId: existing.id, timeoutSeconds: 20)
         } catch {
             log.warning("timeout waiting for \(existing.id) to stop: \(error); sending SIGKILL")
-            do { try await containerClient.kill(id: existing.id, signal: SIGKILL) } catch { log.warning("failed to SIGKILL \(existing.id): \(error)") }
-            // small wait after SIGKILL
+            do {
+                try await containerClient.kill(id: existing.id, signal: SIGKILL)
+            } catch {
+                log.warning("failed to SIGKILL \(existing.id): \(error)")
+            }
             try? await Task.sleep(nanoseconds: 700_000_000)
         }
-        // 3) Try to delete (force on retry)
-        do { try await containerClient.delete(id: existing.id) }
-        catch {
+        do {
+            try await containerClient.delete(id: existing.id)
+        } catch {
             log.warning("failed to delete \(existing.id): \(error); retrying forced delete after short delay")
             try? await Task.sleep(nanoseconds: 700_000_000)
-            do { try await containerClient.delete(id: existing.id, force: true) } catch { log.warning("forced delete attempt failed for \(existing.id): \(error)") }
+            do {
+                try await containerClient.delete(id: existing.id, force: true)
+            } catch {
+                log.warning("forced delete attempt failed for \(existing.id): \(error)")
+            }
         }
-        projectState[project.name]?.containers.removeValue(forKey: serviceName)
+        projectState[projectName]?.containers.removeValue(forKey: serviceName)
+    }
+
+    private func trackComposeHostReservation(
+        serviceName: String,
+        networkId: String,
+        hostname: String,
+        plugin: String
+    ) {
+        composeHostReservations[serviceName, default: []].insert(
+            ComposeHostReservation(
+                networkId: networkId,
+                hostname: hostname,
+                plugin: plugin
+            )
+        )
+    }
+
+    private func consumeTrackedComposeHostReservations(for serviceName: String) {
+        composeHostReservations.removeValue(forKey: serviceName)
+    }
+
+    private func releaseTrackedComposeHostReservations() async {
+        let reservations = composeHostReservations
+        composeHostReservations = [:]
+
+        for reservation in reservations.values.flatMap({ $0 }) {
+            let client = NetworkClient(id: reservation.networkId, plugin: reservation.plugin)
+            try? await client.deallocate(hostname: reservation.hostname)
+        }
+    }
+
+    private func reuseExistingContainer(
+        project: Project,
+        serviceName: String,
+        service: Service,
+        containerId: String,
+        existing: ContainerSnapshot
+    ) async throws {
+        projectState[project.name]?.containers[serviceName] = ContainerState(
+            serviceName: serviceName,
+            containerID: existing.id,
+            containerName: containerId,
+            status: existing.status == .running ? .starting : .stopped
+        )
+
+        guard existing.status != .running else {
+            return
+        }
+
+        for mount in existing.configuration.mounts where mount.isVirtiofs {
+            if !FileManager.default.fileExists(atPath: mount.source) {
+                throw ContainerizationError(.invalidState, message: "path '\(mount.source)' is not a directory")
+            }
+        }
+
+        let initProcess = try await containerClient.bootstrap(id: existing.id, stdio: [nil, nil, nil])
+        try await initProcess.start()
+        projectState[project.name]?.containers[serviceName]?.status = .starting
+    }
+
+    nonisolated internal func shouldCreateNewContainer(after resolution: ExistingContainerResolution) -> Bool {
+        if case .createNew = resolution {
+            return true
+        }
+        return false
     }
 
     /// Ensure the image is available for services that need building
@@ -1248,7 +1500,10 @@ public actor Orchestrator {
 
         // Attach networks for this service and opt into runtime-managed container DNS.
         let networkIds = try resolvedAttachmentNetworkIds(project: project, service: service)
-        let networking = try makeContainerNetworkingConfiguration(containerId: config.id, networkIds: networkIds)
+        let networking = try makeContainerNetworkingConfiguration(
+            containerId: config.id,
+            networkIds: networkIds
+        )
         config.networks = networking.attachments
         config.dns = networking.dns
         config.hosts = try await resolveComposeHosts(
@@ -1284,22 +1539,43 @@ public actor Orchestrator {
 
         // Add resource limits (compose-style parsing for memory like "2g", "2048MB").
         if let cpus = service.cpus {
-            config.resources.cpus = Int(cpus) ?? 4
+            config.resources.cpus = try resolvedCPUCount(cpus)
         }
         config.resources.memoryInBytes = resolvedMemoryLimit(for: service)
 
-        labels["com.apple.container.compose.config-hash"] = computeConfigHash(
+        labels["com.apple.container.compose.config-hash"] = configurationReuseHash(
             project: project,
             serviceName: serviceName,
             service: service,
             imageName: imageName,
-            process: processConfig,
-            ports: config.publishedPorts,
-            mounts: config.mounts
+            configuration: config
         )
         config.labels = labels
 
         return config
+    }
+
+    private func expectedConfigurationHash(
+        project: Project,
+        serviceName: String,
+        service: Service,
+        imageName: String,
+        removeOnExit: Bool
+    ) async throws -> String {
+        let configuration = try await createContainerConfiguration(
+            project: project,
+            serviceName: serviceName,
+            service: service,
+            imageName: imageName,
+            removeOnExit: removeOnExit
+        )
+        return configurationReuseHash(
+            project: project,
+            serviceName: serviceName,
+            service: service,
+            imageName: imageName,
+            configuration: configuration
+        )
     }
 
     func resolvedMemoryLimit(for service: Service) -> UInt64 {
@@ -1323,6 +1599,31 @@ public actor Orchestrator {
         return Self.defaultServiceMemoryInBytes
     }
 
+    nonisolated internal func resolvedCPUCount(_ cpus: String) throws -> Int {
+        let trimmed = cpus.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              let decimal = Decimal(string: trimmed, locale: Locale(identifier: "en_US_POSIX"))
+        else {
+            throw ContainerizationError(.invalidArgument, message: "Invalid cpus value '\(cpus)'")
+        }
+
+        var value = decimal
+        var rounded = Decimal()
+        NSDecimalRound(&rounded, &value, 0, .plain)
+
+        guard decimal == rounded else {
+            throw ContainerizationError(.invalidArgument, message: "Fractional cpus value '\(cpus)' is not supported")
+        }
+
+        let number = NSDecimalNumber(decimal: rounded)
+        let intValue = number.intValue
+        guard intValue > 0, number == NSDecimalNumber(value: intValue) else {
+            throw ContainerizationError(.invalidArgument, message: "Invalid cpus value '\(cpus)'")
+        }
+
+        return intValue
+    }
+
     private func publishSpec(from port: PortMapping) -> String {
         let protoSuffix = port.portProtocol == "tcp" ? "" : "/\(port.portProtocol)"
         if let hostIP = port.hostIP, !hostIP.isEmpty {
@@ -1334,14 +1635,38 @@ public actor Orchestrator {
         return "\(port.hostPort):\(port.containerPort)\(protoSuffix)"
     }
 
-    private func computeConfigHash(
+    nonisolated internal func configurationReuseHash(
+        project: Project,
+        serviceName: String,
+        service: Service,
+        imageName: String,
+        configuration: ContainerConfiguration
+    ) -> String {
+        computeConfigHash(
+            project: project,
+            serviceName: serviceName,
+            service: service,
+            imageName: imageName,
+            process: configuration.initProcess,
+            ports: configuration.publishedPorts,
+            mounts: configuration.mounts,
+            networks: configuration.networks,
+            dns: configuration.dns,
+            hosts: configuration.hosts
+        )
+    }
+
+    nonisolated private func computeConfigHash(
         project: Project,
         serviceName: String,
         service: Service,
         imageName: String,
         process: ProcessConfiguration,
         ports: [PublishPort],
-        mounts: [Filesystem]
+        mounts: [Filesystem],
+        networks: [AttachmentConfiguration],
+        dns: ContainerConfiguration.DNSConfiguration?,
+        hosts: [ContainerConfiguration.HostEntry]
     ) -> String {
         let sig = ConfigSignature(
             image: imageName,
@@ -1355,6 +1680,24 @@ public actor Orchestrator {
             // For mount hashing, use stable identifiers: for virtiofs binds use host path; for named/anonymous volumes, use logical name
             mounts: mounts.map { m in
                 MountSig(source: m.isVolume ? (m.volumeName ?? m.source) : m.source, destination: m.destination, options: m.options)
+            },
+            networks: networks.map {
+                NetworkSig(
+                    network: $0.network,
+                    hostname: $0.options.hostname,
+                    mtu: $0.options.mtu
+                )
+            },
+            dns: dns.map {
+                DNSSig(
+                    nameservers: $0.nameservers,
+                    domain: $0.domain,
+                    searchDomains: $0.searchDomains,
+                    options: $0.options
+                )
+            },
+            hosts: hosts.map {
+                HostSig(ipAddress: $0.ipAddress, hostnames: $0.hostnames)
             },
             labels: service.labels,
             health: service.healthCheck.map { HealthSig(test: $0.test, interval: $0.interval, timeout: $0.timeout, retries: $0.retries, startPeriod: $0.startPeriod) }
@@ -1381,9 +1724,10 @@ public actor Orchestrator {
                 result.append(Filesystem.tmpfs(destination: v.target, options: v.readOnly ? ["ro"] : []))
             case .volume:
                 let name = try resolveVolumeName(project: project, serviceName: serviceName, mount: v)
+                let volumeDefinition = project.volumes[v.source]
                 let ensured = try await ensureVolume(
                     name: name,
-                    isExternal: project.volumes[name]?.external ?? false,
+                    isExternal: volumeDefinition?.external ?? false,
                     project: project,
                     serviceName: serviceName,
                     target: v.target
@@ -1425,7 +1769,23 @@ public actor Orchestrator {
         if mount.source.isEmpty {
             return anonymousVolumeName(projectName: project.name, serviceName: serviceName, target: mount.target)
         }
-        return mount.source
+        return resolvedProjectVolumeName(project: project, logicalName: mount.source)
+    }
+
+    nonisolated internal func resolvedProjectVolumeName(project: Project, logicalName: String) -> String {
+        guard let volume = project.volumes[logicalName] else {
+            return "\(project.name)_\(logicalName)"
+        }
+
+        if let explicitName = volume.externalName, !explicitName.isEmpty {
+            return explicitName
+        }
+
+        if volume.external {
+            return logicalName
+        }
+
+        return "\(project.name)_\(logicalName)"
     }
 
     /// Generate a deterministic anonymous volume name allowed by volume naming rules.
@@ -1475,6 +1835,9 @@ public actor Orchestrator {
         let memory: String?
         let ports: [PortSig]
         let mounts: [MountSig]
+        let networks: [NetworkSig]
+        let dns: DNSSig?
+        let hosts: [HostSig]
         let labels: [String: String]
         let health: HealthSig?
 
@@ -1486,6 +1849,8 @@ public actor Orchestrator {
             let sortedArgs = arguments
             let sortedPorts = ports.sorted { $0.key < $1.key }
             let sortedMounts = mounts.sorted { $0.key < $1.key }
+            let sortedNetworks = networks.sorted { $0.key < $1.key }
+            let sortedHosts = hosts.sorted { $0.key < $1.key }
             let sortedLabels: [LabelSig] = labels
                 .sorted { $0.key < $1.key }
                 .map { LabelSig(key: $0.key, value: $0.value) }
@@ -1499,6 +1864,9 @@ public actor Orchestrator {
                 memory: memory,
                 ports: sortedPorts,
                 mounts: sortedMounts,
+                networks: sortedNetworks,
+                dns: dns,
+                hosts: sortedHosts,
                 labels: sortedLabels,
                 health: health
             )
@@ -1522,6 +1890,9 @@ public actor Orchestrator {
             let memory: String?
             let ports: [PortSig]
             let mounts: [MountSig]
+            let networks: [NetworkSig]
+            let dns: DNSSig?
+            let hosts: [HostSig]
             let labels: [LabelSig]
             let health: HealthSig?
         }
@@ -1547,6 +1918,26 @@ public actor Orchestrator {
         var key: String { "\(destination)=\(source):\(options.sorted().joined(separator: ","))" }
     }
 
+    private struct NetworkSig: Codable {
+        let network: String
+        let hostname: String
+        let mtu: UInt32?
+        var key: String { "\(network)=\(hostname):\(mtu.map(String.init) ?? "")" }
+    }
+
+    private struct DNSSig: Codable {
+        let nameservers: [String]
+        let domain: String?
+        let searchDomains: [String]
+        let options: [String]
+    }
+
+    private struct HostSig: Codable {
+        let ipAddress: String
+        let hostnames: [String]
+        var key: String { "\(ipAddress)=\(hostnames.sorted().joined(separator: ","))" }
+    }
+
     private struct HealthSig: Codable {
         let test: [String]
         let interval: TimeInterval?
@@ -1556,7 +1947,7 @@ public actor Orchestrator {
     }
 
     /// Build images for services that need building
-    private func buildImagesIfNeeded(
+    internal func buildImagesIfNeeded(
         project: Project,
         services: [String: Service],
         progressHandler: ProgressUpdateHandler?
@@ -1577,19 +1968,9 @@ public actor Orchestrator {
 
         for (serviceName, service) in servicesToBuild {
             guard let buildConfig = service.build else { continue }
-            let imageName = service.effectiveImageName(projectName: project.name)
 
             // Generate cache key based on build context
             let cacheKey = buildCacheKey(serviceName: serviceName, buildConfig: buildConfig, projectName: project.name)
-
-            if let configuredImage = service.image,
-               (try? await ClientImage.get(reference: configuredImage)) != nil
-            {
-                log.info("Using existing image '\(imageName)' for service '\(serviceName)'")
-                buildCache[cacheKey] = imageName
-                cachedBuilds.append((serviceName, imageName))
-                continue
-            }
 
             // Check if we have a cached build
             if let cachedImage = buildCache[cacheKey] {
@@ -1812,8 +2193,43 @@ public actor Orchestrator {
         return service.extraHosts.contains { $0.address == "host-gateway" }
     }
 
+    nonisolated internal func composeNetworkNames(for service: Service) -> [String] {
+        guard service.networkMode == nil else {
+            return []
+        }
+        return service.networks.isEmpty ? ["default"] : service.networks
+    }
+
+    nonisolated internal func composeNetworkIdsByName(
+        project: Project,
+        service: Service
+    ) throws -> [String: String] {
+        let composeNetworks = composeNetworkNames(for: service)
+        guard !composeNetworks.isEmpty else {
+            return [:]
+        }
+        if service.networks.isEmpty {
+            return ["default": ClientNetwork.defaultNetworkName]
+        }
+
+        return Dictionary(
+            uniqueKeysWithValues: composeNetworks.map { networkName in
+                let network = project.networks[networkName]
+                let resolvedNetworkName = network?.name ?? networkName
+                let networkId = networkId(
+                    for: project,
+                    networkName: resolvedNetworkName,
+                    external: network?.external ?? false,
+                    externalName: network?.externalName
+                )
+                return (networkName, networkId)
+            }
+        )
+    }
+
     nonisolated private func networkId(for project: Project, networkName: String, external: Bool, externalName: String?) -> String {
-        if external { return externalName ?? networkName }
+        if let externalName, !externalName.isEmpty { return externalName }
+        if external { return networkName }
         return "\(project.name)_\(networkName)"
     }
 
@@ -1885,15 +2301,155 @@ public actor Orchestrator {
         serviceName: String,
         service: Service
     ) async throws -> [ContainerConfiguration.HostEntry] {
-        guard !service.networks.isEmpty else { return [] }
+        guard !composeNetworkNames(for: service).isEmpty else { return [] }
+
+        let plannedPeerHosts = try await resolvePlannedComposePeerHosts(
+            project: project,
+            serviceName: serviceName,
+            service: service
+        )
 
         let allContainers = try await containerClient.list()
-        return try composePeerHosts(
+        let startupServiceNames = Set(activeStartupServices.keys)
+        let runtimePeerHosts = try composePeerHosts(
             project: project,
             serviceName: serviceName,
             service: service,
-            containers: allContainers
+            containers: allContainers.filter { snapshot in
+                guard let peerServiceName = snapshot.configuration.labels["com.apple.compose.service"] else {
+                    return true
+                }
+                return !startupServiceNames.contains(peerServiceName)
+            }
         )
+
+        return mergeHostEntries(plannedPeerHosts + runtimePeerHosts)
+    }
+
+    private func resolvePlannedComposePeerHosts(
+        project: Project,
+        serviceName: String,
+        service: Service
+    ) async throws -> [ContainerConfiguration.HostEntry] {
+        let currentComposeNetworks = composeNetworkNames(for: service)
+        guard !currentComposeNetworks.isEmpty else { return [] }
+        guard !activeStartupServices.isEmpty else { return [] }
+
+        var plannedAttachments: [ComposePeerAttachment] = []
+
+        for (peerServiceName, peerService) in activeStartupServices {
+            guard peerServiceName != serviceName else { continue }
+
+            let explicitAttachments = try plannedComposeNetworkAttachments(
+                project: project,
+                serviceName: peerServiceName,
+                service: peerService
+            )
+            let sharedNetworks = currentComposeNetworks.filter { explicitAttachments[$0] != nil }
+
+            for networkName in sharedNetworks {
+                guard let attachment = explicitAttachments[networkName] else { continue }
+                let reservedAttachment = try await lookupOrReserveComposeAttachment(
+                    serviceName: peerServiceName,
+                    networkId: attachment.network,
+                    hostname: attachment.options.hostname
+                )
+                plannedAttachments.append(
+                    ComposePeerAttachment(
+                        serviceName: peerServiceName,
+                        networkName: networkName,
+                        ipAddress: reservedAttachment.ipv4Address.address.description,
+                        aliases: peerService.networkAliases[networkName] ?? []
+                    )
+                )
+            }
+        }
+
+        return composePeerHosts(plannedAttachments: plannedAttachments)
+    }
+
+    private func lookupOrReserveComposeAttachment(
+        serviceName: String,
+        networkId: String,
+        hostname: String
+    ) async throws -> Attachment {
+        let networkState = try await ClientNetwork.get(id: networkId)
+        guard let plugin = networkState.pluginInfo?.plugin else {
+            throw ContainerizationError(.internalError, message: "network \(networkId) is missing plugin information")
+        }
+
+        let client = NetworkClient(id: networkId, plugin: plugin)
+        if let existing = try await client.lookup(hostname: hostname) {
+            return existing
+        }
+
+        let (attachment, _) = try await client.allocate(hostname: hostname)
+        trackComposeHostReservation(
+            serviceName: serviceName,
+            networkId: networkId,
+            hostname: hostname,
+            plugin: plugin
+        )
+        return attachment
+    }
+
+    nonisolated internal func plannedComposeNetworkAttachments(
+        project: Project,
+        serviceName: String,
+        service: Service
+    ) throws -> [String: AttachmentConfiguration] {
+        let composeNetworks = composeNetworkNames(for: service)
+        guard !composeNetworks.isEmpty else {
+            return [:]
+        }
+
+        let containerId = service.containerName ?? "\(project.name)_\(serviceName)"
+        if service.networks.isEmpty {
+            let networking = try makeContainerNetworkingConfiguration(containerId: containerId, networkIds: [])
+            if let attachment = networking.attachments.first {
+                return ["default": attachment]
+            }
+            return [:]
+        }
+
+        let explicitNetworkIds = try mapServiceNetworkIds(project: project, service: service)
+        let networkIds = try resolvedAttachmentNetworkIds(project: project, service: service)
+        let networking = try makeContainerNetworkingConfiguration(
+            containerId: containerId,
+            networkIds: networkIds
+        )
+        let attachmentByNetworkId = Dictionary(
+            uniqueKeysWithValues: networking.attachments.map { ($0.network, $0) }
+        )
+
+        var attachmentsByName: [String: AttachmentConfiguration] = [:]
+        for (networkName, networkId) in zip(composeNetworks, explicitNetworkIds) {
+            if let attachment = attachmentByNetworkId[networkId] {
+                attachmentsByName[networkName] = attachment
+            }
+        }
+        return attachmentsByName
+    }
+
+    nonisolated internal func composePeerHosts(
+        plannedAttachments: [ComposePeerAttachment]
+    ) -> [ContainerConfiguration.HostEntry] {
+        var hostnamesByAddress: [String: Set<String>] = [:]
+
+        for plannedAttachment in plannedAttachments {
+            var hostnames = hostnamesByAddress[plannedAttachment.ipAddress] ?? []
+            hostnames.insert(plannedAttachment.serviceName)
+            hostnames.formUnion(plannedAttachment.aliases)
+            hostnamesByAddress[plannedAttachment.ipAddress] = hostnames
+        }
+
+        return hostnamesByAddress.map { address, hostnames in
+            ContainerConfiguration.HostEntry(
+                ipAddress: address,
+                hostnames: Array(hostnames).sorted()
+            )
+        }
+        .sorted { $0.ipAddress < $1.ipAddress }
     }
 
     nonisolated internal func composePeerHosts(
@@ -1902,21 +2458,12 @@ public actor Orchestrator {
         service: Service,
         containers: [ContainerSnapshot]
     ) throws -> [ContainerConfiguration.HostEntry] {
-        guard !service.networks.isEmpty else { return [] }
-
-        let currentNetworkIds = Dictionary(
-            uniqueKeysWithValues: service.networks.map { networkName in
-                let network = project.networks[networkName]
-                let resolvedNetworkName = network?.name ?? networkName
-                let networkId = networkId(
-                    for: project,
-                    networkName: resolvedNetworkName,
-                    external: network?.external ?? false,
-                    externalName: network?.externalName
-                )
-                return (networkId, networkName)
+        let currentNetworkIds = try Dictionary(
+            uniqueKeysWithValues: composeNetworkIdsByName(project: project, service: service).map { networkName, networkId in
+                (networkId, networkName)
             }
         )
+        guard !currentNetworkIds.isEmpty else { return [] }
 
         var hostnamesByAddress: [String: Set<String>] = [:]
 
@@ -1936,7 +2483,6 @@ public actor Orchestrator {
                     hostnames.formUnion(peerService.networkAliases[networkName] ?? [])
                 }
                 hostnamesByAddress[address] = hostnames
-                break
             }
         }
 
@@ -1981,7 +2527,6 @@ public actor Orchestrator {
         log.info("Stopping project '\(project.name)'")
 
         // Determine containers to remove
-        let prefix = "\(project.name)_"
         let expectedIds: Set<String> = Set(project.services.map { name, svc in
             svc.containerName ?? "\(project.name)_\(name)"
         })
@@ -1990,11 +2535,12 @@ public actor Orchestrator {
         do {
             let all = try await containerClient.list()
             let targets: [ContainerSnapshot] = all.filter { container in
-                if removeOrphans {
-                    return container.id.hasPrefix(prefix)
-                } else {
-                    return expectedIds.contains(container.id)
-                }
+                matchesDownTarget(
+                    projectName: project.name,
+                    expectedIds: expectedIds,
+                    container: container,
+                    removeOrphans: removeOrphans
+                )
             }
 
             for c in targets {
@@ -2010,10 +2556,11 @@ public actor Orchestrator {
         // Optionally remove volumes defined in the project (non-external)
         var removedVolumes: [String] = []
         if removeVolumes {
-            for (_, vol) in project.volumes {
+            for (logicalName, vol) in project.volumes {
                 if !vol.external {
-                    do { try await ClientVolume.delete(name: vol.name); removedVolumes.append(vol.name) }
-                    catch { log.warning("failed to delete volume \(vol.name): \(error)") }
+                    let volumeName = resolvedProjectVolumeName(project: project, logicalName: logicalName)
+                    do { try await ClientVolume.delete(name: volumeName); removedVolumes.append(volumeName) }
+                    catch { log.warning("failed to delete volume \(volumeName): \(error)") }
                 }
             }
 
@@ -2036,7 +2583,7 @@ public actor Orchestrator {
         do {
             for (_, net) in project.networks {
                 guard !net.external else { continue }
-                let id = networkId(for: project, networkName: net.name, external: false, externalName: nil)
+                let id = networkId(for: project, networkName: net.name, external: false, externalName: net.externalName)
                 // Best effort: delete if present
                 do { try await ClientNetwork.delete(id: id) } catch { log.warning("failed to delete network \(id): \(error)") }
             }
@@ -2050,12 +2597,12 @@ public actor Orchestrator {
     }
 
     /// Get service statuses
-    public func ps(project: Project) async throws -> [ServiceStatus] {
+    public func ps(project: Project, all: Bool = false) async throws -> [ServiceStatus] {
         let idToService: [String: String] = Dictionary(uniqueKeysWithValues: project.services.map { (name, svc) in
             let id = svc.containerName ?? "\(project.name)_\(name)"
             return (id, name)
         })
-        let containers = try await containerClient.list()
+        let containers = try await containerClient.list(filters: psContainerListFilters(all: all))
         let filtered = containers.filter { c in
             if let proj = c.configuration.labels["com.apple.compose.project"], proj == project.name { return true }
             // Fallback to prefix if labels are missing
@@ -2079,6 +2626,10 @@ public actor Orchestrator {
                                           image: imageRef))
         }
         return statuses
+    }
+
+    nonisolated internal func psContainerListFilters(all: Bool) -> ContainerListFilters {
+        all ? .all : ContainerListFilters(status: .running)
     }
 
     /// Get logs from services
@@ -2123,12 +2674,9 @@ public actor Orchestrator {
                 // Strongly retain file handles so readabilityHandler keeps firing.
                 private var retained: [FileHandle] = []
                 init(_ c: AsyncThrowingStream<LogEntry, Error>.Continuation) { self.cont = c }
-                func emit(_ svc: String, _ containerName: String, _ stream: LogEntry.LogStream, data: Data) {
-                    guard !data.isEmpty else { return }
-                    if let text = String(data: data, encoding: .utf8) {
-                        for line in text.split(whereSeparator: { $0.isNewline }) {
-                            cont.yield(LogEntry(serviceName: svc, containerName: containerName, message: String(line), stream: stream))
-                        }
+                func emit(_ entries: [LogEntry]) {
+                    for entry in entries {
+                        cont.yield(entry)
                     }
                 }
                 func retain(_ fh: FileHandle) { retained.append(fh) }
@@ -2136,47 +2684,292 @@ public actor Orchestrator {
                 func fail(_ error: Error) { cont.yield(with: .failure(error)) }
             }
             let emitter = Emitter(continuation)
-            actor Counter { var value: Int; init(_ v: Int){ value = v } ; func dec() -> Int { value -= 1; return value } }
-            let counter = Counter(targets.count)
+            actor FollowState {
+                private var data: Data
+                private var finished: Bool
+
+                init(_ data: Data = Data(), finished: Bool = false) {
+                    self.data = data
+                    self.finished = finished
+                }
+
+                func buffer() -> Data {
+                    data
+                }
+
+                func setBuffer(_ newValue: Data) {
+                    data = newValue
+                }
+
+                func finishIfNeeded() -> Data? {
+                    guard !finished else { return nil }
+                    finished = true
+                    return data
+                }
+            }
+            actor Counter {
+                var value: Int
+                init(_ v: Int) { value = v }
+                func dec(by amount: Int = 1) -> Int {
+                    value -= amount
+                    return value
+                }
+            }
+            let streamsPerContainer = includeBoot ? 2 : 1
+            let counter = Counter(targets.count * streamsPerContainer)
 
             // For each container, open log file handles in async tasks
             for (svc, container) in targets {
                 Task.detached {
                     do {
                         let fds = try await self.containerClient.logs(id: container.id)
-                        if follow {
-                            if fds.indices.contains(0) {
-                                let fh = fds[0]
+                        let handles: [(FileHandle, LogEntry.LogStream)] = includeBoot
+                            ? [(fds[0], .stdout), (fds[1], .stderr)]
+                            : [(fds[0], .stdout)]
+
+                        for (fh, stream) in handles {
+                            let initialData = try self.readLogData(fileHandle: fh, tail: tail)
+                            let initial = self.decodeLogChunk(
+                                serviceName: svc,
+                                containerName: container.id,
+                                stream: stream,
+                                buffer: Data(),
+                                incoming: initialData,
+                                timestamps: timestamps,
+                                flush: !follow
+                            )
+                            emitter.emit(initial.entries)
+
+                            if follow {
+                                if self.followEOFAction(status: container.status) == .finish {
+                                    let final = self.decodeLogChunk(
+                                        serviceName: svc,
+                                        containerName: container.id,
+                                        stream: stream,
+                                        buffer: initial.remainder,
+                                        incoming: Data(),
+                                        timestamps: timestamps,
+                                        flush: true
+                                    )
+                                    emitter.emit(final.entries)
+                                    let left = await counter.dec()
+                                    if left == 0 { emitter.finish() }
+                                    continue
+                                }
+
+                                _ = try? fh.seekToEnd()
+                                let state = FollowState(initial.remainder)
                                 fh.readabilityHandler = { handle in
-                                    emitter.emit(svc, container.id, .stdout, data: handle.availableData)
+                                    let data = handle.availableData
+                                    Task {
+                                        if data.isEmpty {
+                                            let status = (try? await self.containerClient.get(id: container.id).status) ?? .stopped
+                                            switch self.followEOFAction(status: status) {
+                                            case .finish:
+                                                fh.readabilityHandler = nil
+                                                let trailingData = (try? fh.readToEnd()) ?? Data()
+                                                if let remainder = await state.finishIfNeeded() {
+                                                    let final = self.decodeLogChunk(
+                                                        serviceName: svc,
+                                                        containerName: container.id,
+                                                        stream: stream,
+                                                        buffer: remainder,
+                                                        incoming: trailingData,
+                                                        timestamps: timestamps,
+                                                        flush: true
+                                                    )
+                                                    emitter.emit(final.entries)
+                                                    let left = await counter.dec()
+                                                    if left == 0 { emitter.finish() }
+                                                }
+                                            case .keepFollowing:
+                                                _ = try? fh.seekToEnd()
+                                            }
+                                            return
+                                        }
+
+                                        let buffer = await state.buffer()
+                                        let parsed = self.decodeLogChunk(
+                                            serviceName: svc,
+                                            containerName: container.id,
+                                            stream: stream,
+                                            buffer: buffer,
+                                            incoming: data,
+                                            timestamps: timestamps,
+                                            flush: false
+                                        )
+                                        await state.setBuffer(parsed.remainder)
+                                        emitter.emit(parsed.entries)
+                                    }
                                 }
                                 emitter.retain(fh)
-                            }
-                            if includeBoot, fds.indices.contains(1) {
-                                let fh = fds[1]
-                                fh.readabilityHandler = { handle in
-                                    emitter.emit(svc, container.id, .stderr, data: handle.availableData)
+
+                                Task.detached {
+                                    while true {
+                                        let status = (try? await self.containerClient.get(id: container.id).status) ?? .stopped
+                                        guard self.followEOFAction(status: status) == .keepFollowing else {
+                                            fh.readabilityHandler = nil
+                                            let trailingData = (try? fh.readToEnd()) ?? Data()
+                                            if let remainder = await state.finishIfNeeded() {
+                                                let final = self.decodeLogChunk(
+                                                    serviceName: svc,
+                                                    containerName: container.id,
+                                                    stream: stream,
+                                                    buffer: remainder,
+                                                    incoming: trailingData,
+                                                    timestamps: timestamps,
+                                                    flush: true
+                                                )
+                                                emitter.emit(final.entries)
+                                                let left = await counter.dec()
+                                                if left == 0 { emitter.finish() }
+                                            }
+                                            return
+                                        }
+
+                                        try? await Task.sleep(nanoseconds: 250_000_000)
+                                    }
                                 }
-                                emitter.retain(fh)
+                            } else {
+                                let final = self.decodeLogChunk(
+                                    serviceName: svc,
+                                    containerName: container.id,
+                                    stream: stream,
+                                    buffer: initial.remainder,
+                                    incoming: Data(),
+                                    timestamps: timestamps,
+                                    flush: true
+                                )
+                                emitter.emit(final.entries)
+                                let left = await counter.dec()
+                                if left == 0 { emitter.finish() }
                             }
-                        } else {
-                            if fds.indices.contains(0) {
-                                emitter.emit(svc, container.id, .stdout, data: fds[0].readDataToEndOfFile())
-                            }
-                            if includeBoot, fds.indices.contains(1) {
-                                emitter.emit(svc, container.id, .stderr, data: fds[1].readDataToEndOfFile())
-                            }
-                            let left = await counter.dec()
-                            if left == 0 { emitter.finish() }
                         }
                     } catch {
                         emitter.fail(error)
-                        let left = await counter.dec()
-                        if left == 0 && !follow { emitter.finish() }
+                        let left = await counter.dec(by: streamsPerContainer)
+                        if left == 0 { emitter.finish() }
                     }
                 }
             }
         }
+    }
+
+    internal enum LogFollowEOFAction: Equatable {
+        case finish
+        case keepFollowing
+    }
+
+    nonisolated internal func followEOFAction(status: RuntimeStatus) -> LogFollowEOFAction {
+        status == .running ? .keepFollowing : .finish
+    }
+
+    nonisolated internal func readLogData(fileHandle: FileHandle, tail: Int?) throws -> Data {
+        let data = try fileHandle.readToEnd() ?? Data()
+        return tailedLogData(data, tail: tail)
+    }
+
+    nonisolated internal func tailedLogData(_ data: Data, tail: Int?) -> Data {
+        guard let tail else { return data }
+        guard tail > 0 else { return Data() }
+        guard let text = String(data: data, encoding: .utf8) else { return data }
+
+        let normalized = text.replacingOccurrences(of: "\r\n", with: "\n")
+        var lines = normalized.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        if normalized.hasSuffix("\n"), !lines.isEmpty {
+            lines.removeLast()
+        }
+        let tailedLines = lines.suffix(tail)
+        return Data(tailedLines.joined(separator: "\n").utf8)
+    }
+
+    nonisolated internal func decodeLogChunk(
+        serviceName: String,
+        containerName: String,
+        stream: LogEntry.LogStream,
+        buffer: Data,
+        incoming: Data,
+        timestamps: Bool,
+        flush: Bool
+    ) -> (entries: [LogEntry], remainder: Data) {
+        var combined = buffer
+        combined.append(incoming)
+        guard !combined.isEmpty else {
+            return ([], Data())
+        }
+
+        let normalized = String(decoding: combined, as: UTF8.self).replacingOccurrences(of: "\r\n", with: "\n")
+        var lines = normalized.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        let hasTrailingNewline = normalized.hasSuffix("\n")
+        let remainder: Data
+
+        if hasTrailingNewline {
+            if !lines.isEmpty {
+                lines.removeLast()
+            }
+            remainder = Data()
+        } else if flush {
+            remainder = Data()
+        } else {
+            let tail = lines.popLast() ?? ""
+            remainder = Data(tail.utf8)
+        }
+
+        let entries = lines.map {
+            parsedLogEntry(
+                serviceName: serviceName,
+                containerName: containerName,
+                stream: stream,
+                line: $0,
+                timestamps: timestamps
+            )
+        }
+        return (entries, remainder)
+    }
+
+    nonisolated internal func parsedLogEntry(
+        serviceName: String,
+        containerName: String,
+        stream: LogEntry.LogStream,
+        line: String,
+        timestamps: Bool
+    ) -> LogEntry {
+        let parsed: (timestamp: Date?, message: String) = timestamps ? parseTimestampPrefix(line) : (nil, line)
+        return LogEntry(
+            serviceName: serviceName,
+            containerName: containerName,
+            message: parsed.message,
+            stream: stream,
+            timestamp: parsed.timestamp
+        )
+    }
+
+    nonisolated internal func parseTimestampPrefix(_ line: String) -> (timestamp: Date?, message: String) {
+        let parts = line.split(maxSplits: 1, whereSeparator: { $0 == " " || $0 == "\t" }).map(String.init)
+        guard parts.count == 2 else {
+            return (nil, line)
+        }
+
+        let formatters: [ISO8601DateFormatter] = [
+            {
+                let formatter = ISO8601DateFormatter()
+                formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+                return formatter
+            }(),
+            {
+                let formatter = ISO8601DateFormatter()
+                formatter.formatOptions = [.withInternetDateTime]
+                return formatter
+            }(),
+        ]
+
+        for formatter in formatters {
+            if let timestamp = formatter.date(from: parts[0]) {
+                return (timestamp, parts[1])
+            }
+        }
+
+        return (nil, line)
     }
 
     /// Start stopped services
@@ -2298,22 +3091,7 @@ public actor Orchestrator {
 
         if detach { return 0 }
 
-        // Forward SIGINT/SIGTERM from the plugin to the exec process (first signal)
-        func installSignal(_ signo: Int32) {
-            signal(signo, SIG_IGN)
-            DispatchQueue.main.async {
-                let src = DispatchSource.makeSignalSource(signal: signo, queue: .main)
-                src.setEventHandler {
-                    Task {
-                        do { try await process.kill(signo) } catch { /* ignore */ }
-                    }
-                }
-                src.resume()
-                ExecSignalRetainer.retain(src)
-            }
-        }
-        installSignal(SIGINT)
-        installSignal(SIGTERM)
+        installProcessSignalForwarders(process: process)
 
         return try await process.wait()
     }
@@ -2357,53 +3135,32 @@ public actor Orchestrator {
             }
         }
 
-        let imageName = service.image ?? "\(project.name)-\(serviceName)"
+        let imageName = resolvedRunImageName(projectName: project.name, service: service)
         try await ensureComposeNetworks(project: project)
         try await buildImagesIfNeeded(project: project, services: [serviceName: service], progressHandler: nil)
         try await ensureImageAvailable(serviceName: serviceName, service: service, imageName: imageName, policy: pullPolicy)
 
         let mergedEnvironment = resolveRunEnvironment(base: service.environment, overrides: environment)
         let runContainerId = oneOffContainerId(projectName: project.name, serviceName: serviceName)
-        let runService = Service(
-            name: service.name,
-            image: service.image,
-            build: service.build,
-            command: command.isEmpty ? service.command : command,
-            entrypoint: service.entrypoint,
-            commandCleared: command.isEmpty ? service.commandCleared : false,
-            entrypointCleared: service.entrypointCleared,
-            workingDir: workdir ?? service.workingDir,
+        let runService = makeOneOffRunService(
+            service: service,
+            command: command,
+            workdir: workdir,
             environment: mergedEnvironment,
-            ports: service.ports,
-            volumes: service.volumes,
-            networks: service.networks,
-            networkMode: service.networkMode,
-            networkAliases: service.networkAliases,
-            dependsOn: service.dependsOn,
-            dependsOnHealthy: service.dependsOnHealthy,
-            dependsOnStarted: service.dependsOnStarted,
-            dependsOnCompletedSuccessfully: service.dependsOnCompletedSuccessfully,
-            healthCheck: service.healthCheck,
-            deploy: service.deploy,
-            restart: service.restart,
             containerName: runContainerId,
-            profiles: service.profiles,
-            labels: service.labels,
-            extraHosts: service.extraHosts,
-            cpus: service.cpus,
-            memory: service.memory,
             tty: tty,
-            stdinOpen: interactive
+            interactive: interactive
         )
 
         let kernel = try await ClientKernel.getDefaultKernel(for: .current)
-        let containerConfig = try await createContainerConfiguration(
+        var containerConfig = try await createContainerConfiguration(
             project: project,
             serviceName: serviceName,
             service: runService,
             imageName: imageName,
             removeOnExit: removeOnExit
         )
+        containerConfig = applyUserOverride(user: user, to: containerConfig)
         let createOptions = ContainerCreateOptions(autoRemove: removeOnExit)
         try await containerClient.create(
             configuration: containerConfig,
@@ -2424,7 +3181,106 @@ public actor Orchestrator {
             return 0
         }
 
+        installProcessSignalForwarders(process: process)
         return try await process.wait()
+    }
+
+    nonisolated internal func installProcessSignalForwarders(
+        process: any ClientProcess,
+        installer: (@Sendable (Int32, @escaping @Sendable () -> Void) -> Void)? = nil
+    ) {
+        let register = installer ?? defaultProcessSignalInstaller
+        for signo in [SIGINT, SIGTERM] {
+            register(signo) {
+                Task {
+                    do { try await process.kill(signo) } catch { /* ignore */ }
+                }
+            }
+        }
+    }
+
+    private nonisolated func defaultProcessSignalInstaller(
+        signo: Int32,
+        action: @escaping @Sendable () -> Void
+    ) {
+        signal(signo, SIG_IGN)
+        DispatchQueue.main.async {
+            let src = DispatchSource.makeSignalSource(signal: signo, queue: .main)
+            src.setEventHandler(handler: action)
+            src.resume()
+            ExecSignalRetainer.retain(src)
+        }
+    }
+
+    nonisolated internal func applyUserOverride(
+        user: String?,
+        to configuration: ContainerConfiguration
+    ) -> ContainerConfiguration {
+        guard let user, !user.isEmpty else { return configuration }
+        var configuration = configuration
+        configuration.initProcess.user = .raw(userString: user)
+        return configuration
+    }
+
+    nonisolated internal func matchesDownTarget(
+        projectName: String,
+        expectedIds: Set<String>,
+        container: ContainerSnapshot,
+        removeOrphans: Bool
+    ) -> Bool {
+        if removeOrphans {
+            if let proj = container.configuration.labels["com.apple.compose.project"] {
+                return proj == projectName
+            }
+            return container.id.hasPrefix("\(projectName)_")
+        }
+        return expectedIds.contains(container.id)
+    }
+
+    nonisolated internal func resolvedRunImageName(projectName: String, service: Service) -> String {
+        service.effectiveImageName(projectName: projectName)
+    }
+
+    nonisolated internal func makeOneOffRunService(
+        service: Service,
+        command: [String],
+        workdir: String?,
+        environment: [String: String],
+        containerName: String,
+        tty: Bool,
+        interactive: Bool
+    ) -> Service {
+        Service(
+            name: service.name,
+            image: service.image,
+            build: service.build,
+            command: command.isEmpty ? service.command : command,
+            entrypoint: service.entrypoint,
+            commandCleared: command.isEmpty ? service.commandCleared : false,
+            entrypointCleared: service.entrypointCleared,
+            workingDir: workdir ?? service.workingDir,
+            environment: environment,
+            ports: [],
+            volumes: service.volumes,
+            networks: service.networks,
+            networkMode: service.networkMode,
+            networkAliases: service.networkAliases,
+            dependsOn: service.dependsOn,
+            dependsOnHealthy: service.dependsOnHealthy,
+            dependsOnStarted: service.dependsOnStarted,
+            dependsOnCompletedSuccessfully: service.dependsOnCompletedSuccessfully,
+            healthCheck: service.healthCheck,
+            deploy: service.deploy,
+            restart: service.restart,
+            containerName: containerName,
+            profiles: service.profiles,
+            labels: service.labels,
+            extraHosts: service.extraHosts,
+            cpus: service.cpus,
+            memory: service.memory,
+            tty: tty,
+            stdinOpen: interactive
+        )
     }
 
     internal func resolveRunEnvironment(base: [String: String], overrides: [String]) -> [String: String] {

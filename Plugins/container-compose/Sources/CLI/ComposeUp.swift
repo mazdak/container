@@ -1,5 +1,5 @@
 //===----------------------------------------------------------------------===//
-// Copyright © 2025 Mazdak Rezvani and contributors. All rights reserved.
+// Copyright © 2026 Apple Inc. and the container project authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -26,6 +26,16 @@ import Darwin
 import Glibc
 #endif
 
+protocol ComposeUpLifecycleController: Sendable {
+    func stop(
+        project: Project,
+        services: [String],
+        timeout: Int,
+        progressHandler: ProgressUpdateHandler?
+    ) async throws
+}
+
+extension Orchestrator: ComposeUpLifecycleController {}
 
 struct ComposeUp: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
@@ -187,6 +197,7 @@ struct ComposeUp: AsyncParsableCommand {
             print("Started project '\(project.name)' in detached mode")
         } else {
             // Install signal handlers so Ctrl-C stops services gracefully
+            let selectedServices = services
             func installSignal(_ signo: Int32) {
                 signal(signo, SIG_IGN)
                 // Create and retain the signal source on the main queue to satisfy concurrency rules
@@ -195,21 +206,12 @@ struct ComposeUp: AsyncParsableCommand {
                     src.setEventHandler {
                         // Use a MainActor-isolated flag so the compiler is happy about concurrency
                         Task { @MainActor in
-                            // Second signal forces exit
-                            if SignalState.shared.seenFirstSignal {
-                                Darwin.exit(130)
-                            }
-                            SignalState.shared.seenFirstSignal = true
-                            do {
-                                print("\nStopping project '\(project.name)' (Ctrl-C again to force)...")
-                                let orchestratorForStop = Orchestrator(log: log)
-                                _ = try await orchestratorForStop.down(project: project, removeVolumes: false, removeOrphans: false, progressHandler: nil)
-                                Darwin.exit(0)
-                            } catch {
-                                // If graceful stop fails, exit with error code
-                                FileHandle.standardError.write(Data("compose: failed to stop services: \(error)\n".utf8))
-                                Darwin.exit(1)
-                            }
+                            let exitCode = await Self.handleAttachedTerminationSignal(
+                                project: project,
+                                services: selectedServices,
+                                lifecycleController: Orchestrator(log: log)
+                            )
+                            Darwin.exit(exitCode)
                         }
                     }
                     src.resume()
@@ -245,6 +247,41 @@ struct ComposeUp: AsyncParsableCommand {
                     FileHandle.standardError.write(Data((line + "\n").utf8))
                 }
             }
+        }
+    }
+
+    @MainActor
+    static func resetSignalStateForTesting() {
+        SignalState.shared.seenFirstSignal = false
+    }
+
+    @MainActor
+    static func handleAttachedTerminationSignal(
+        project: Project,
+        services: [String],
+        lifecycleController: any ComposeUpLifecycleController,
+        stdoutWriter: @escaping @Sendable (String) -> Void = { print($0) },
+        stderrWriter: @escaping @Sendable (String) -> Void = {
+            FileHandle.standardError.write(Data($0.utf8))
+        }
+    ) async -> Int32 {
+        if SignalState.shared.seenFirstSignal {
+            return 130
+        }
+        SignalState.shared.seenFirstSignal = true
+
+        do {
+            stdoutWriter("\nStopping services for project '\(project.name)' (Ctrl-C again to force)...")
+            try await lifecycleController.stop(
+                project: project,
+                services: services,
+                timeout: 10,
+                progressHandler: nil
+            )
+            return 0
+        } catch {
+            stderrWriter("compose: failed to stop services: \(error)\n")
+            return 1
         }
     }
 }

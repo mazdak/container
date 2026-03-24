@@ -1,5 +1,5 @@
 //===----------------------------------------------------------------------===//
-// Copyright © 2025 Mazdak Rezvani and contributors. All rights reserved.
+// Copyright © 2026 Apple Inc. and the container project authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -391,10 +391,12 @@ public struct Volume: Sendable {
     public let name: String
     public let driver: String
     public let external: Bool
+    public let externalName: String?
     
-    public init(name: String, driver: String = "local", external: Bool = false) {
+    public init(name: String, driver: String = "local", external: Bool = false, externalName: String? = nil) {
         self.name = name
         self.driver = driver
         self.external = external
+        self.externalName = externalName
     }
 }

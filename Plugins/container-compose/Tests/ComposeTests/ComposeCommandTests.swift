@@ -1,5 +1,5 @@
 //===----------------------------------------------------------------------===//
-// Copyright © 2025 Mazdak Rezvani and contributors. All rights reserved.
+// Copyright © 2026 Apple Inc. and the container project authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,8 +18,27 @@ import ComposeCore
 import Foundation
 import Logging
 import Testing
+import ArgumentParser
 
 @testable import ComposePlugin
+
+private actor RecordingComposeUpLifecycleController: ComposeUpLifecycleController {
+    private(set) var stopCalls: [(projectName: String, services: [String], timeout: Int)] = []
+
+    func stop(
+        project: Project,
+        services: [String],
+        timeout: Int,
+        progressHandler: ProgressUpdateHandler?
+    ) async throws {
+        _ = progressHandler
+        stopCalls.append((project.name, services, timeout))
+    }
+
+    func snapshotStopCalls() -> [(projectName: String, services: [String], timeout: Int)] {
+        stopCalls
+    }
+}
 
 @Suite(.serialized)
 struct ComposeCommandTests {
@@ -240,6 +259,139 @@ struct ComposeCommandTests {
             #expect(ProcessInfo.processInfo.environment["IMAGE_NAME"] == nil)
             #expect(app.image == "include-value")
         }
+    }
+
+    @Test
+    func testArgumentNormalizerMovesAllowAnchorFlagsAfterSubcommand() {
+        #expect(
+            ComposeArgumentNormalizer.normalize(["--allow-anchors", "validate", "--quiet"]) ==
+                ["validate", "--allow-anchors", "--quiet"]
+        )
+        #expect(
+            ComposeArgumentNormalizer.normalize(["--no-allow-anchors", "validate", "--quiet"]) ==
+                ["validate", "--no-allow-anchors", "--quiet"]
+        )
+    }
+
+    @Test
+    func testAttachedTerminalOptionsDefaultToInteractiveTTYOnTerminal() {
+        let resolved = resolveAttachedTerminalOptions(
+            detach: false,
+            interactiveFlag: false,
+            ttyFlag: false,
+            noTty: false,
+            stdinIsTTY: true,
+            stdoutIsTTY: true
+        )
+
+        #expect(resolved == AttachedTerminalOptions(interactive: true, tty: true))
+    }
+
+    @Test
+    func testAttachedTerminalOptionsRespectNoTTYWithoutDisablingInteractiveInput() {
+        let resolved = resolveAttachedTerminalOptions(
+            detach: false,
+            interactiveFlag: false,
+            ttyFlag: false,
+            noTty: true,
+            stdinIsTTY: true,
+            stdoutIsTTY: true
+        )
+
+        #expect(resolved == AttachedTerminalOptions(interactive: true, tty: false))
+    }
+
+    @Test
+    func testAttachedTerminalOptionsDoNotForceTTYForDetachedCommands() {
+        let resolved = resolveAttachedTerminalOptions(
+            detach: true,
+            interactiveFlag: false,
+            ttyFlag: false,
+            noTty: false,
+            stdinIsTTY: true,
+            stdoutIsTTY: true
+        )
+
+        #expect(resolved == AttachedTerminalOptions(interactive: false, tty: false))
+    }
+
+    @Test
+    @MainActor
+    func testAttachedUpSignalHandlerStopsServicesWithoutDeletingContainers() async throws {
+        ComposeUp.resetSignalStateForTesting()
+        defer { ComposeUp.resetSignalStateForTesting() }
+
+        let lifecycleController = RecordingComposeUpLifecycleController()
+        let project = Project(
+            name: "demo",
+            services: ["web": Service(name: "web", image: "nginx:alpine")]
+        )
+
+        let exitCode = await ComposeUp.handleAttachedTerminationSignal(
+            project: project,
+            services: ["web"],
+            lifecycleController: lifecycleController,
+            stdoutWriter: { _ in },
+            stderrWriter: { _ in }
+        )
+
+        #expect(exitCode == 0)
+        let calls = await lifecycleController.snapshotStopCalls()
+        #expect(calls.count == 1)
+        #expect(calls[0].projectName == "demo")
+        #expect(calls[0].services == ["web"])
+        #expect(calls[0].timeout == 10)
+    }
+
+    @Test
+    @MainActor
+    func testAttachedUpSignalHandlerSecondSignalForcesExitWithoutStoppingAgain() async throws {
+        ComposeUp.resetSignalStateForTesting()
+        defer { ComposeUp.resetSignalStateForTesting() }
+
+        let lifecycleController = RecordingComposeUpLifecycleController()
+        let project = Project(
+            name: "demo",
+            services: ["web": Service(name: "web", image: "nginx:alpine")]
+        )
+
+        let firstExitCode = await ComposeUp.handleAttachedTerminationSignal(
+            project: project,
+            services: ["web"],
+            lifecycleController: lifecycleController,
+            stdoutWriter: { _ in },
+            stderrWriter: { _ in }
+        )
+        let secondExitCode = await ComposeUp.handleAttachedTerminationSignal(
+            project: project,
+            services: ["web"],
+            lifecycleController: lifecycleController,
+            stdoutWriter: { _ in },
+            stderrWriter: { _ in }
+        )
+
+        #expect(firstExitCode == 0)
+        #expect(secondExitCode == 130)
+        let calls = await lifecycleController.snapshotStopCalls()
+        #expect(calls.count == 1)
+    }
+
+    @Test
+    func testComposePlatformSupportRejectsUnsupportedMacOSVersions() {
+        #expect(throws: ValidationError.self) {
+            try ComposePlatformSupport.validateSupported(
+                osVersion: OperatingSystemVersion(majorVersion: 25, minorVersion: 0, patchVersion: 0),
+                environment: [:]
+            )
+        }
+    }
+
+    @Test
+    func testComposePlatformSupportAllowsTestBypassOnUnsupportedHosts() throws {
+        try ComposePlatformSupport.validateSupported(
+            osVersion: OperatingSystemVersion(majorVersion: 14, minorVersion: 0, patchVersion: 0),
+            environment: [ComposePlatformSupport.testBypassEnvironmentVariable: "1"]
+        )
     }
 
     private func makeOptions(arguments: [String] = []) throws -> ComposeOptions {

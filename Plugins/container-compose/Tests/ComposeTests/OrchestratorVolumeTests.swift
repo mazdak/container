@@ -1,5 +1,17 @@
 //===----------------------------------------------------------------------===//
-// Copyright © 2025 Mazdak Rezvani and contributors.
+// Copyright © 2026 Apple Inc. and the container project authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//   https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 //===----------------------------------------------------------------------===//
 
 import Foundation
@@ -112,7 +124,7 @@ struct OrchestratorVolumeTests {
         // Named volume -> block volume with real host path from fake client
         let named = try #require(fs.first { $0.destination == "/var/lib/data" })
         #expect(named.isVolume)
-        #expect(named.source == "/vols/namedvol")
+        #expect(named.source == "/vols/proj_namedvol")
 
         // Anonymous -> created with generated name, but we mount by its host path
         let anon = try #require(fs.first { $0.destination == "/cache" })
@@ -125,8 +137,43 @@ struct OrchestratorVolumeTests {
 
         let calls = await fakePopulator.snapshotCalls()
         #expect(calls.count == 2)
-        #expect(calls.contains { $0.volume == "namedvol" && $0.target == "/var/lib/data" && $0.imageName == "alpine:latest" })
+        #expect(calls.contains { $0.volume == "proj_namedvol" && $0.target == "/var/lib/data" && $0.imageName == "alpine:latest" })
         #expect(calls.contains { $0.target == "/cache" && $0.imageName == "alpine:latest" })
+    }
+
+    @Test
+    func testResolveComposeMountsUsesExplicitComposeVolumeName() async throws {
+        let fakeClient = FakeVolumeClient()
+        let fakePopulator = FakeVolumePopulator()
+        let orch = Orchestrator(log: log, volumeClient: fakeClient, volumePopulator: fakePopulator)
+
+        let mounts = [
+            VolumeMount(source: "namedvol", target: "/var/lib/data", type: .volume)
+        ]
+        let service = Service(name: "app", image: "alpine:latest", volumes: mounts)
+        let project = Project(
+            name: "proj",
+            services: ["app": service],
+            networks: [:],
+            volumes: ["namedvol": Volume(name: "namedvol", externalName: "my-data-volume")]
+        )
+
+        let fs = try await orch.resolveComposeMounts(
+            project: project,
+            serviceName: "app",
+            imageName: "alpine:latest",
+            mounts: mounts
+        )
+
+        let named = try #require(fs.first)
+        #expect(named.isVolume)
+        #expect(named.source == "/vols/my-data-volume")
+
+        let calls = await fakePopulator.snapshotCalls()
+        #expect(calls.count == 1)
+        #expect(calls[0].volume == "my-data-volume")
+        #expect(calls[0].target == "/var/lib/data")
+        #expect(calls[0].imageName == "alpine:latest")
     }
 
     @Test
@@ -168,7 +215,7 @@ struct OrchestratorVolumeTests {
     func testResolveComposeMountsSkipsCopyUpForExistingVolume() async throws {
         let fakeClient = FakeVolumeClient()
         let fakePopulator = FakeVolumePopulator()
-        _ = try await fakeClient.create(name: "namedvol", driver: "local", driverOpts: [:], labels: [:])
+        _ = try await fakeClient.create(name: "proj_namedvol", driver: "local", driverOpts: [:], labels: [:])
 
         let orch = Orchestrator(log: log, volumeClient: fakeClient, volumePopulator: fakePopulator)
         let mounts = [

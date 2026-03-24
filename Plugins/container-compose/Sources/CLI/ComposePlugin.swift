@@ -1,5 +1,5 @@
 //===----------------------------------------------------------------------===//
-// Copyright © 2025 Mazdak Rezvani and contributors. All rights reserved.
+// Copyright © 2026 Apple Inc. and the container project authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,12 +20,32 @@ import Foundation
 import ContainerLog
 import Logging
 
+enum ComposePlatformSupport {
+    static let minimumSupportedMajorVersion = 26
+    static let testBypassEnvironmentVariable = "CONTAINER_COMPOSE_TEST_DISABLE_PLATFORM_CHECK"
+
+    static func validateSupported(
+        osVersion: OperatingSystemVersion = ProcessInfo.processInfo.operatingSystemVersion,
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) throws {
+        if environment[testBypassEnvironmentVariable] == "1" {
+            return
+        }
+
+        guard osVersion.majorVersion >= minimumSupportedMajorVersion else {
+            throw ValidationError(
+                "container compose requires macOS \(minimumSupportedMajorVersion) or newer; current host is macOS \(osVersion.majorVersion).\(osVersion.minorVersion).\(osVersion.patchVersion)"
+            )
+        }
+    }
+}
+
 struct ComposeGlobalOptions: ParsableArguments {
     @OptionGroup
     var shared: Flags.Logging
 
     @Flag(name: .long, inversion: .prefixedNo, help: "Allow YAML anchors and merge keys in compose files")
-    var allowAnchors = true
+    var allowAnchors = false
 
     var debug: Bool {
         shared.debug
@@ -69,6 +89,7 @@ struct ComposePlugin: AsyncParsableCommand {
 
         do {
             var command = try Self.parseAsRoot(args)
+            try ComposePlatformSupport.validateSupported()
             if var asyncCommand = command as? AsyncParsableCommand {
                 try await asyncCommand.run()
             } else {
@@ -88,6 +109,7 @@ enum ComposeArgumentNormalizer {
     private static let rootFlags: [String: String] = [
         "--debug": "--debug",
         "--allow-anchors": "--allow-anchors",
+        "--no-allow-anchors": "--no-allow-anchors",
     ]
 
     private static let rootOptionsWithValues: [String: String] = [
