@@ -21,7 +21,7 @@ import Dispatch
 nonisolated(unsafe) var log: Logger = {
     LoggingSystem.bootstrap(StreamLogHandler.standardError)
     var logger = Logger(label: "com.apple.containercompose")
-    logger.logLevel = .info
+    logger.logLevel = .warning
     return logger
 }()
 

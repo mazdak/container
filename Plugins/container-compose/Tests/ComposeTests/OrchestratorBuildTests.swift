@@ -257,23 +257,56 @@ struct OrchestratorBuildTests {
     }
 
     @Test
-    func testResolvedMemoryLimitDefaultsToSixGiBWhenUnspecified() async throws {
+    func testResolvedResourcesDefaultToContainerDefaultsWhenUnspecified() async throws {
         let orchestrator = Orchestrator(log: log)
         let service = Service(name: "frontend", image: "resq-fullstack:dev")
 
-        let memory = await orchestrator.resolvedMemoryLimit(for: service)
+        let resources = try await orchestrator.resolvedResources(for: service)
 
-        #expect(memory == 6144.mib())
+        #expect(resources.cpus == 4)
+        #expect(resources.memoryInBytes == 1024.mib())
     }
 
     @Test
-    func testResolvedMemoryLimitUsesExplicitComposeValue() async throws {
+    func testResolvedResourcesUseContainerPropertyOverridesWhenUnspecified() async throws {
         let orchestrator = Orchestrator(log: log)
-        let service = Service(name: "frontend", image: "resq-fullstack:dev", memory: "2g")
+        let service = Service(name: "frontend", image: "resq-fullstack:dev")
 
-        let memory = await orchestrator.resolvedMemoryLimit(for: service)
+        DefaultsStore.set(value: "2", key: .defaultContainerCPUs)
+        DefaultsStore.set(value: "2g", key: .defaultContainerMemory)
+        defer {
+            DefaultsStore.unset(key: .defaultContainerCPUs)
+            DefaultsStore.unset(key: .defaultContainerMemory)
+        }
 
-        #expect(memory == 2048.mib())
+        let resources = try await orchestrator.resolvedResources(for: service)
+
+        #expect(resources.cpus == 2)
+        #expect(resources.memoryInBytes == 2048.mib())
+    }
+
+    @Test
+    func testResolvedResourcesUseExplicitComposeValues() async throws {
+        let orchestrator = Orchestrator(log: log)
+        let service = Service(name: "frontend", image: "resq-fullstack:dev", cpus: "2", memory: "2g")
+
+        let resources = try await orchestrator.resolvedResources(for: service)
+
+        #expect(resources.cpus == 2)
+        #expect(resources.memoryInBytes == 2048.mib())
+    }
+
+    @Test
+    func testResolvedResourcesTreatMaxMemoryAsContainerDefault() async throws {
+        let orchestrator = Orchestrator(log: log)
+        let service = Service(name: "frontend", image: "resq-fullstack:dev", memory: "max")
+
+        DefaultsStore.set(value: "2g", key: .defaultContainerMemory)
+        defer { DefaultsStore.unset(key: .defaultContainerMemory) }
+
+        let resources = try await orchestrator.resolvedResources(for: service)
+
+        #expect(resources.memoryInBytes == 2048.mib())
     }
 
     @Test
@@ -658,6 +691,46 @@ struct OrchestratorBuildTests {
         )
 
         #expect(baseHash != rebuiltHash)
+    }
+
+    @Test
+    func testConfigurationReuseHashIncludesResolvedResourceDefaults() {
+        let orchestrator = Orchestrator(log: log)
+        let project = Project(name: "demo")
+        let service = Service(name: "api", image: "demo:api")
+
+        let image = ImageDescription(
+            reference: "demo:api",
+            descriptor: Descriptor(
+                mediaType: "application/vnd.oci.image.index.v1+json",
+                digest: "sha256:test",
+                size: 1
+            )
+        )
+
+        let baseConfig = ContainerConfiguration(
+            id: "demo_api",
+            image: image,
+            process: ProcessConfiguration(executable: "/bin/sh", arguments: [], environment: [])
+        )
+        var updatedConfig = baseConfig
+        updatedConfig.resources.cpus = 2
+        updatedConfig.resources.memoryInBytes = 2048.mib()
+
+        let baseHash = orchestrator.configurationReuseHash(
+            project: project,
+            serviceName: "api",
+            service: service,
+            configuration: baseConfig
+        )
+        let updatedHash = orchestrator.configurationReuseHash(
+            project: project,
+            serviceName: "api",
+            service: service,
+            configuration: updatedConfig
+        )
+
+        #expect(baseHash != updatedHash)
     }
 
     @Test

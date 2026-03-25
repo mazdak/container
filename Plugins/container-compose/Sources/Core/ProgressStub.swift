@@ -54,18 +54,23 @@ public typealias ProgressUpdateHandler = @Sendable (_ events: [ProgressUpdateEve
 
 public class ProgressBar {
     private let config: ProgressConfig
+    private var started = false
+    private var finished = false
     public var handler: ProgressUpdateHandler = { _ in }
     
     public init(config: ProgressConfig) {
         self.config = config
-        print("[\(config.description)]")
     }
     
     public func start() {
-        // No-op for now
+        guard !started else { return }
+        started = true
+        print("\(config.description)...")
     }
     
     public func finish() {
+        guard !finished else { return }
+        finished = true
         print("✓ \(config.description) complete")
     }
 }

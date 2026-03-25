@@ -160,6 +160,41 @@ struct ComposeCLITests {
     }
 
     @Test
+    func testValidateDefaultLoggingDoesNotEmitInfoLogsToStderr() throws {
+        let dir = try ComposeCLITestSupport.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let composeURL = dir.appendingPathComponent("docker-compose.yml")
+        try """
+        services:
+          web:
+            image: nginx:alpine
+        """.write(to: composeURL, atomically: true, encoding: .utf8)
+
+        let result = try ComposeCLITestSupport.run(arguments: ["validate", "-f", composeURL.path], currentDirectory: dir)
+        #expect(result.status == 0)
+        #expect(!result.stderr.contains("info com.apple.containercompose"))
+        #expect(!result.stderr.contains("Loaded compose file"))
+    }
+
+    @Test
+    func testValidateDebugFlagEmitsInfoLogsToStderr() throws {
+        let dir = try ComposeCLITestSupport.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let composeURL = dir.appendingPathComponent("docker-compose.yml")
+        try """
+        services:
+          web:
+            image: nginx:alpine
+        """.write(to: composeURL, atomically: true, encoding: .utf8)
+
+        let result = try ComposeCLITestSupport.run(arguments: ["--debug", "validate", "-f", composeURL.path], currentDirectory: dir)
+        #expect(result.status == 0)
+        #expect(result.stderr.contains("Loaded compose file: docker-compose.yml"))
+    }
+
+    @Test
     func testValidateQuietSuppressesOutput() throws {
         let dir = try ComposeCLITestSupport.makeTempDir()
         defer { try? FileManager.default.removeItem(at: dir) }

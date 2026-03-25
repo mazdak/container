@@ -607,8 +607,6 @@ public struct DefaultVolumePopulator: VolumePopulator {
 /// )
 /// ```
 public actor Orchestrator {
-    static let defaultServiceMemoryInBytes: UInt64 = 6144.mib()
-
     public enum PullPolicy: String, Sendable {
         case always
         case missing
@@ -1581,11 +1579,8 @@ public actor Orchestrator {
             mounts: service.volumes
         )
 
-        // Add resource limits (compose-style parsing for memory like "2g", "2048MB").
-        if let cpus = service.cpus {
-            config.resources.cpus = try resolvedCPUCount(cpus)
-        }
-        config.resources.memoryInBytes = resolvedMemoryLimit(for: service)
+        // Resolve service resources through the shared container defaults path.
+        config.resources = try resolvedResources(for: service)
 
         labels["com.apple.container.compose.config-hash"] = configurationReuseHash(
             project: project,
@@ -1620,25 +1615,21 @@ public actor Orchestrator {
         )
     }
 
-    func resolvedMemoryLimit(for service: Service) -> UInt64 {
-        guard let memStr = service.memory, !memStr.isEmpty else {
-            return Self.defaultServiceMemoryInBytes
+    func resolvedResources(for service: Service) throws -> ContainerConfiguration.Resources {
+        let cpus: Int64?
+        if let cpuString = service.cpus {
+            cpus = Int64(try resolvedCPUCount(cpuString))
+        } else {
+            cpus = nil
+        }
+        let memory: String?
+        if let memStr = service.memory?.trimmingCharacters(in: .whitespacesAndNewlines), !memStr.isEmpty {
+            memory = memStr.lowercased() == "max" ? nil : memStr
+        } else {
+            memory = nil
         }
 
-        do {
-            if memStr.lowercased() == "max" {
-                return Self.defaultServiceMemoryInBytes
-            }
-
-            let res = try Parser.resources(cpus: nil, memory: memStr)
-            if let bytes = res.memoryInBytes as UInt64? {
-                return bytes
-            }
-        } catch {
-            log.warning("Invalid memory value '\\(memStr)'; using default. Error: \\(error)")
-        }
-
-        return Self.defaultServiceMemoryInBytes
+        return try Parser.resources(cpus: cpus, memory: memory)
     }
 
     nonisolated internal func resolvedCPUCount(_ cpus: String) throws -> Int {
@@ -1689,6 +1680,7 @@ public actor Orchestrator {
             service: service,
             image: configuration.image,
             process: configuration.initProcess,
+            resources: configuration.resources,
             ports: configuration.publishedPorts,
             mounts: configuration.mounts,
             networks: configuration.networks,
@@ -1703,6 +1695,7 @@ public actor Orchestrator {
         service: Service,
         image: ImageDescription,
         process: ProcessConfiguration,
+        resources: ContainerConfiguration.Resources,
         ports: [PublishPort],
         mounts: [Filesystem],
         networks: [AttachmentConfiguration],
@@ -1720,8 +1713,8 @@ public actor Orchestrator {
             arguments: process.arguments,
             workdir: process.workingDirectory,
             environment: process.environment,
-            cpus: service.cpus,
-            memory: service.memory,
+            cpus: resources.cpus,
+            memoryInBytes: resources.memoryInBytes,
             ports: ports.map { PortSig(host: "\($0.hostAddress)", hostPort: Int($0.hostPort), containerPort: Int($0.containerPort), proto: $0.proto == .tcp ? "tcp" : "udp") },
             // For mount hashing, use stable identifiers: for virtiofs binds use host path; for named/anonymous volumes, use logical name
             mounts: mounts.map { m in
@@ -1877,8 +1870,8 @@ public actor Orchestrator {
         let arguments: [String]
         let workdir: String
         let environment: [String]
-        let cpus: String?
-        let memory: String?
+        let cpus: Int
+        let memoryInBytes: UInt64
         let ports: [PortSig]
         let mounts: [MountSig]
         let networks: [NetworkSig]
@@ -1907,7 +1900,7 @@ public actor Orchestrator {
                 workdir: workdir,
                 environment: sortedEnv,
                 cpus: cpus,
-                memory: memory,
+                memoryInBytes: memoryInBytes,
                 ports: sortedPorts,
                 mounts: sortedMounts,
                 networks: sortedNetworks,
@@ -1932,8 +1925,8 @@ public actor Orchestrator {
             let arguments: [String]
             let workdir: String
             let environment: [String]
-            let cpus: String?
-            let memory: String?
+            let cpus: Int
+            let memoryInBytes: UInt64
             let ports: [PortSig]
             let mounts: [MountSig]
             let networks: [NetworkSig]

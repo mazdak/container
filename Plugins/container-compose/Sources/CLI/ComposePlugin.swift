@@ -56,7 +56,7 @@ struct ComposeGlobalOptions: ParsableArguments {
         if debug || debugEnvVar != nil {
             log.logLevel = .debug
         } else {
-            log.logLevel = .info
+            log.logLevel = .warning
         }
     }
 }
