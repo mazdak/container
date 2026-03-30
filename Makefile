@@ -188,6 +188,7 @@ integration: init-block
 	{ \
 		exit_code=0; \
 		CLITEST_LOG_ROOT=$(LOG_ROOT) && export CLITEST_LOG_ROOT ; \
+		$(SWIFT) test -c $(BUILD_CONFIGURATION) $(SWIFT_CONFIGURATION) --filter TestCLIVersion || exit_code=1 ; \
 		$(SWIFT) test -c $(BUILD_CONFIGURATION) $(SWIFT_CONFIGURATION) --filter TestCLINetwork || exit_code=1 ; \
 		$(SWIFT) test -c $(BUILD_CONFIGURATION) $(SWIFT_CONFIGURATION) --filter TestCLIRunLifecycle || exit_code=1 ; \
 		$(SWIFT) test -c $(BUILD_CONFIGURATION) $(SWIFT_CONFIGURATION) --filter TestCLIExecCommand || exit_code=1 ; \
@@ -206,6 +207,7 @@ integration: init-block
 		$(SWIFT) test -c $(BUILD_CONFIGURATION) $(SWIFT_CONFIGURATION) --filter TestCLIVolumes || exit_code=1 ; \
 		$(SWIFT) test -c $(BUILD_CONFIGURATION) $(SWIFT_CONFIGURATION) --filter TestCLIKernelSet || exit_code=1 ; \
 		$(SWIFT) test -c $(BUILD_CONFIGURATION) $(SWIFT_CONFIGURATION) --filter TestCLIAnonymousVolumes || exit_code=1 ; \
+		$(SWIFT) test -c $(BUILD_CONFIGURATION) $(SWIFT_CONFIGURATION) --filter TestCLINotFound || exit_code=1 ; \
 		$(SWIFT) test -c $(BUILD_CONFIGURATION) $(SWIFT_CONFIGURATION) --filter TestCLINoParallelCases || exit_code=1 ; \
 		echo Ensuring apiserver stopped after the CLI integration tests ; \
 		scripts/ensure-container-stopped.sh ; \
