@@ -18,6 +18,8 @@ import ArgumentParser
 import ContainerAPIClient
 import ContainerBuild
 import ContainerImagesServiceClient
+import ContainerPersistence
+import ContainerPlugin
 import Containerization
 import ContainerizationError
 import ContainerizationOCI
@@ -28,8 +30,6 @@ import TerminalProgress
 
 extension Application {
     public struct BuildCommand: AsyncLoggableCommand {
-        private static let hiddenDockerDir = ".com.apple.container.dockerfiles"
-
         public init() {}
         public static var configuration: CommandConfiguration {
             var config = CommandConfiguration()
@@ -149,6 +149,7 @@ extension Application {
         var pull: Bool = false
 
         public func run() async throws {
+            let containerSystemConfig: ContainerSystemConfig = try await ConfigurationLoader.load()
             do {
                 let timeout: Duration = .seconds(300)
                 let progressConfig = try ProgressConfig(
@@ -176,7 +177,7 @@ extension Application {
                                 let fh = try await client.dial(id: "buildkit", port: vsockPort)
 
                                 let threadGroup: MultiThreadedEventLoopGroup = MultiThreadedEventLoopGroup(numberOfThreads: System.coreCount)
-                                let b = try Builder(socket: fh, group: threadGroup)
+                                let b = try Builder(socket: fh, group: threadGroup, logger: log)
 
                                 // If this call succeeds, then BuildKit is running.
                                 let _ = try await b.info()
@@ -192,7 +193,8 @@ extension Application {
                                     memory: memory,
                                     log: log,
                                     dnsNameservers: dnsNameservers,
-                                    progressUpdate: progress.handler
+                                    progressUpdate: progress.handler,
+                                    containerSystemConfig: containerSystemConfig,
                                 )
 
                                 // wait (seconds) for builder to start listening on vsock
@@ -220,7 +222,6 @@ extension Application {
 
                 let buildFileData: Data
                 var ignoreFileData: Data? = nil
-                var hiddenDockerDir: String? = nil
                 // Dockerfile should be read from stdin
                 if dockerfile == "-" {
                     let tempFile = FileManager.default.temporaryDirectory.appendingPathComponent("Dockerfile-\(UUID().uuidString)")
@@ -248,24 +249,6 @@ extension Application {
                     let ignoreFileURL = URL(filePath: dockerfile + ".dockerignore")
                     buildFileData = try Data(contentsOf: URL(filePath: dockerfile))
                     ignoreFileData = try? Data(contentsOf: ignoreFileURL)
-
-                    if var ignoreFileData {
-                        hiddenDockerDir = Self.hiddenDockerDir
-                        let hiddenDirInContext = URL(fileURLWithPath: contextDir).appendingPathComponent(Self.hiddenDockerDir)
-
-                        try FileManager.default.createDirectory(at: hiddenDirInContext, withIntermediateDirectories: true)
-                        try buildFileData.write(to: hiddenDirInContext.appendingPathComponent("Dockerfile"))
-
-                        ignoreFileData.append("\n\(Self.hiddenDockerDir)".data(using: .utf8) ?? Data())
-                        try ignoreFileData.write(to: hiddenDirInContext.appendingPathComponent("Dockerfile.dockerignore"))
-                    }
-                }
-
-                defer {
-                    if let hiddenDockerDir {
-                        let hiddenDirInContext = URL(fileURLWithPath: contextDir).appendingPathComponent(hiddenDockerDir)
-                        try? FileManager.default.removeItem(at: hiddenDirInContext)
-                    }
                 }
 
                 let secretsData: [String: Data] = try self.secrets.mapValues { secret in
@@ -350,7 +333,10 @@ extension Application {
                         }
                         return results
                     }()
-                    group.addTask { [terminal, buildArg, secretsData, contextDir, hiddenDockerDir, label, noCache, target, quiet, cacheIn, cacheOut, pull] in
+                    group.addTask {
+                        [
+                            terminal, buildArg, secretsData, contextDir, ignoreFileData, label, noCache, target, quiet, cacheIn, cacheOut, pull, exports, imageNames, tempURL, log,
+                        ] in
                         let config = Builder.BuildConfig(
                             buildID: buildID,
                             contentStore: RemoteContentStoreClient(),
@@ -358,7 +344,7 @@ extension Application {
                             secrets: secretsData,
                             contextDir: contextDir,
                             dockerfile: buildFileData,
-                            hiddenDockerDir: hiddenDockerDir,
+                            dockerignore: ignoreFileData,
                             labels: label,
                             noCache: noCache,
                             platforms: [Platform](platforms),
@@ -369,80 +355,81 @@ extension Application {
                             exports: exports,
                             cacheIn: cacheIn,
                             cacheOut: cacheOut,
-                            pull: pull
+                            pull: pull,
+                            containerSystemConfig: containerSystemConfig,
                         )
                         progress.finish()
 
                         try await builder.build(config)
+
+                        let unpackProgressConfig = try ProgressConfig(
+                            description: "Unpacking built image",
+                            itemsName: "entries",
+                            showTasks: exports.count > 1,
+                            totalTasks: exports.count
+                        )
+                        let unpackProgress = ProgressBar(config: unpackProgressConfig)
+                        defer {
+                            unpackProgress.finish()
+                        }
+                        unpackProgress.start()
+
+                        var finalMessage = imageNames.joined(separator: "\n")
+                        let taskManager = ProgressTaskCoordinator()
+                        // Currently, only a single export can be specified.
+                        for exp in exports {
+                            unpackProgress.add(tasks: 1)
+                            let unpackTask = await taskManager.startTask()
+                            switch exp.type {
+                            case "oci":
+                                try Task.checkCancellation()
+                                guard let dest = exp.destination else {
+                                    throw ContainerizationError(.invalidArgument, message: "dest is required \(exp.rawValue)")
+                                }
+                                let result = try await ClientImage.load(from: dest.absolutePath(), force: false)
+                                guard result.rejectedMembers.isEmpty else {
+                                    log.error("archive contains invalid members", metadata: ["paths": "\(result.rejectedMembers)"])
+                                    throw ContainerizationError(.internalError, message: "failed to load archive")
+                                }
+                                for image in result.images {
+                                    try Task.checkCancellation()
+                                    try await image.unpack(platform: nil, progressUpdate: ProgressTaskCoordinator.handler(for: unpackTask, from: unpackProgress.handler))
+
+                                    // Tag the unpacked image with all requested tags
+                                    for tagName in imageNames {
+                                        try Task.checkCancellation()
+                                        _ = try await image.tag(new: tagName)
+                                    }
+                                }
+                            case "tar":
+                                guard let dest = exp.destination else {
+                                    throw ContainerizationError(.invalidArgument, message: "dest is required \(exp.rawValue)")
+                                }
+                                let tarURL = tempURL.appendingPathComponent("out.tar")
+                                try FileManager.default.moveItem(at: tarURL, to: dest)
+                                finalMessage = dest.absolutePath()
+                            case "local":
+                                guard let dest = exp.destination else {
+                                    throw ContainerizationError(.invalidArgument, message: "dest is required \(exp.rawValue)")
+                                }
+                                let localDir = tempURL.appendingPathComponent("local")
+
+                                guard FileManager.default.fileExists(atPath: localDir.path) else {
+                                    throw ContainerizationError(.invalidArgument, message: "expected local output not found")
+                                }
+                                try FileManager.default.copyItem(at: localDir, to: dest)
+                                finalMessage = dest.absolutePath()
+                            default:
+                                throw ContainerizationError(.invalidArgument, message: "invalid exporter \(exp.rawValue)")
+                            }
+                        }
+                        await taskManager.finish()
+                        unpackProgress.finish()
+                        print(finalMessage)
                     }
 
                     try await group.next()
                 }
-
-                let unpackProgressConfig = try ProgressConfig(
-                    description: "Unpacking built image",
-                    itemsName: "entries",
-                    showTasks: exports.count > 1,
-                    totalTasks: exports.count
-                )
-                let unpackProgress = ProgressBar(config: unpackProgressConfig)
-                defer {
-                    unpackProgress.finish()
-                }
-                unpackProgress.start()
-
-                var finalMessage = "Successfully built \(imageNames.joined(separator: ", "))"
-                let taskManager = ProgressTaskCoordinator()
-                // Currently, only a single export can be specified.
-                for exp in exports {
-                    unpackProgress.add(tasks: 1)
-                    let unpackTask = await taskManager.startTask()
-                    switch exp.type {
-                    case "oci":
-                        try Task.checkCancellation()
-                        guard let dest = exp.destination else {
-                            throw ContainerizationError(.invalidArgument, message: "dest is required \(exp.rawValue)")
-                        }
-                        let result = try await ClientImage.load(from: dest.absolutePath(), force: false)
-                        guard result.rejectedMembers.isEmpty else {
-                            log.error("archive contains invalid members", metadata: ["paths": "\(result.rejectedMembers)"])
-                            throw ContainerizationError(.internalError, message: "failed to load archive")
-                        }
-                        for image in result.images {
-                            try Task.checkCancellation()
-                            try await image.unpack(platform: nil, progressUpdate: ProgressTaskCoordinator.handler(for: unpackTask, from: unpackProgress.handler))
-
-                            // Tag the unpacked image with all requested tags
-                            for tagName in imageNames {
-                                try Task.checkCancellation()
-                                _ = try await image.tag(new: tagName)
-                            }
-                        }
-                    case "tar":
-                        guard let dest = exp.destination else {
-                            throw ContainerizationError(.invalidArgument, message: "dest is required \(exp.rawValue)")
-                        }
-                        let tarURL = tempURL.appendingPathComponent("out.tar")
-                        try FileManager.default.moveItem(at: tarURL, to: dest)
-                        finalMessage = "Successfully exported to \(dest.absolutePath())"
-                    case "local":
-                        guard let dest = exp.destination else {
-                            throw ContainerizationError(.invalidArgument, message: "dest is required \(exp.rawValue)")
-                        }
-                        let localDir = tempURL.appendingPathComponent("local")
-
-                        guard FileManager.default.fileExists(atPath: localDir.path) else {
-                            throw ContainerizationError(.invalidArgument, message: "expected local output not found")
-                        }
-                        try FileManager.default.copyItem(at: localDir, to: dest)
-                        finalMessage = "Successfully exported to \(dest.absolutePath())"
-                    default:
-                        throw ContainerizationError(.invalidArgument, message: "invalid exporter \(exp.rawValue)")
-                    }
-                }
-                await taskManager.finish()
-                unpackProgress.finish()
-                print(finalMessage)
             } catch {
                 throw NSError(domain: "Build", code: 1, userInfo: [NSLocalizedDescriptionKey: "\(error)"])
             }

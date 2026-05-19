@@ -27,7 +27,7 @@ import Synchronization
 import SystemPackage
 
 public actor VolumesService {
-    private let resourceRoot: URL
+    private let resourceRoot: FilePath
     private let store: ContainerPersistence.FilesystemEntityStore<Volume>
     private let log: Logger
     private let lock = AsyncLock()
@@ -37,8 +37,8 @@ public actor VolumesService {
     private static let entityFile = "entity.json"
     private static let blockFile = "volume.img"
 
-    public init(resourceRoot: URL, containersService: ContainersService, log: Logger) throws {
-        try FileManager.default.createDirectory(at: resourceRoot, withIntermediateDirectories: true)
+    public init(resourceRoot: FilePath, containersService: ContainersService, log: Logger) throws {
+        try FileManager.default.createDirectory(atPath: resourceRoot.string, withIntermediateDirectories: true)
         self.resourceRoot = resourceRoot
         self.store = try FilesystemEntityStore<Volume>(path: resourceRoot, type: "volumes", log: log)
         self.containersService = containersService
@@ -257,8 +257,9 @@ public actor VolumesService {
         return sizeInBytes
     }
 
+    // FIXME: These don't guarantee that name doesn't have component separators.
     private nonisolated func volumePath(for name: String) -> String {
-        resourceRoot.appendingPathComponent(name).path
+        resourceRoot.appending(name).string
     }
 
     private nonisolated func entityPath(for name: String) -> String {
@@ -275,14 +276,36 @@ public actor VolumesService {
         try fm.createDirectory(atPath: volumePath, withIntermediateDirectories: true, attributes: nil)
     }
 
-    private func createVolumeImage(for name: String, sizeInBytes: UInt64 = VolumeStorage.defaultVolumeSizeBytes) throws {
+    static func parseJournalConfig(_ value: String) throws -> EXT4.JournalConfig {
+        let parts = value.split(separator: ":", maxSplits: 1)
+        guard let modeSubstring = parts.first else {
+            throw VolumeError.storageError("invalid journal configuration: expected 'mode' or 'mode:size'")
+        }
+        let modeString = String(modeSubstring)
+        let mode: EXT4.JournalConfig.JournalMode
+        switch modeString {
+        case "writeback": mode = .writeback
+        case "ordered": mode = .ordered
+        case "journal": mode = .journal
+        default:
+            throw VolumeError.storageError("invalid journal mode '\(modeString)': must be writeback, ordered, or journal")
+        }
+        let size: UInt64? =
+            try parts.count > 1
+            ? UInt64(Measurement.parse(parsing: String(parts[1])).converted(to: .bytes).value)
+            : nil
+        return EXT4.JournalConfig(size: size, defaultMode: mode)
+    }
+
+    private func createVolumeImage(for name: String, sizeInBytes: UInt64 = VolumeStorage.defaultVolumeSizeBytes, journal: EXT4.JournalConfig? = nil) throws {
         let blockPath = blockPath(for: name)
 
         // Use the containerization library's EXT4 formatter
         let formatter = try EXT4.Formatter(
             FilePath(blockPath),
             blockSize: 4096,
-            minDiskSize: sizeInBytes
+            minDiskSize: sizeInBytes,
+            journal: journal
         )
 
         try formatter.close()
@@ -323,7 +346,9 @@ public actor VolumesService {
             sizeInBytes = VolumeStorage.defaultVolumeSizeBytes
         }
 
-        try createVolumeImage(for: name, sizeInBytes: sizeInBytes)
+        let journalConfig = try driverOpts["journal"].map { try Self.parseJournalConfig($0) }
+
+        try createVolumeImage(for: name, sizeInBytes: sizeInBytes, journal: journalConfig)
 
         let volume = Volume(
             name: name,

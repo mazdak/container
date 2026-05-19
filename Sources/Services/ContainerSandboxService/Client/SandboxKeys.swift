@@ -43,9 +43,9 @@ public enum SandboxKeys: String {
     /// Container statistics
     case statistics
 
-    /// Network resource keys.
-    case allocatedAttachments
-    case networkAdditionalData
-    case networkAttachment
-    case networkPluginInfo
+    /// Special-case environment variables recomputed on each container start
+    case dynamicEnv
+
+    /// Per-network connection info passed to the runtime so it can allocate directly.
+    case networkBootstrapInfos
 }

@@ -43,6 +43,8 @@ container run [<options>] <image> [<arguments> ...]
 **Management Options**
 
 *   `-a, --arch <arch>`: Set arch if image can target multiple architectures (default: arm64)
+*   `--cap-add <cap>`: Add a Linux capability (e.g. `CAP_NET_RAW`, `NET_RAW`, or `ALL`)
+*   `--cap-drop <cap>`: Drop a Linux capability (e.g. `CAP_NET_RAW`, `NET_RAW`, or `ALL`)
 *   `--cidfile <cidfile>`: Write the container ID to the path provided
 *   `-d, --detach`: Run the container and detach from the process
 *   `--dns <ip>`: DNS nameserver IP address
@@ -83,13 +85,13 @@ container run [<options>] <image> [<arguments> ...]
             - `10.*.*.*`
             - `192.168.*.*`
             - `172.16.*.*` through `172.31.*.*`
-        - The host ends with the machine's default container DNS domain (as defined in `DefaultsStore.Keys.defaultDNSDomain`, located [here](../Sources/ContainerPersistence/DefaultsStore.swift))
+        - The host ends with the machine's default container DNS domain (as defined in `DNSConfig.defaultDomain`, located [here](../Sources/ContainerPersistence/ContainerSystemConfig.swift))
 
         For internal/local registries, the client uses **HTTP**. Otherwise, it uses **HTTPS**.
 
 **Progress Options**
 
-*   `--progress <type>`: Progress type (format: none|ansi) (default: ansi)
+*   `--progress <type>`: Progress type (format: none|ansi|plain|color) (default: ansi)
 
 **Examples**
 
@@ -204,6 +206,8 @@ container create [<options>] <image> [<arguments> ...]
 **Management Options**
 
 *   `-a, --arch <arch>`: Set arch if image can target multiple architectures (default: arm64)
+*   `--cap-add <cap>`: Add a Linux capability (e.g. `CAP_NET_RAW`, `NET_RAW`, or `ALL`)
+*   `--cap-drop <cap>`: Drop a Linux capability (e.g. `CAP_NET_RAW`, `NET_RAW`, or `ALL`)
 *   `--cidfile <cidfile>`: Write the container ID to the path provided
 *   `-d, --detach`: Run the container and detach from the process
 *   `--dns <ip>`: DNS nameserver IP address
@@ -510,7 +514,7 @@ container image pull [--debug] [--scheme <scheme>] [--progress <type>] [--arch <
 **Options**
 
 *   `--scheme <scheme>`: Scheme to use when connecting to the container registry. One of (http, https, auto) (default: auto)
-*   `--progress <type>`: Progress type (format: none|ansi) (default: ansi)
+*   `--progress <type>`: Progress type (format: none|ansi|plain|color) (default: ansi)
 *   `-a, --arch <arch>`: Limit the pull to the specified architecture
 *   `--os <os>`: Limit the pull to the specified OS
 *   `--platform <platform>`: Limit the pull to the specified platform (format: os/arch[/variant], takes precedence over --os and --arch)
@@ -532,7 +536,7 @@ container image push [--scheme <scheme>] [--progress <type>] [--arch <arch>] [--
 **Options**
 
 *   `--scheme <scheme>`: Scheme to use when connecting to the container registry. One of (http, https, auto) (default: auto)
-*   `--progress <type>`: Progress type (format: none|ansi) (default: ansi)
+*   `--progress <type>`: Progress type (format: none|ansi|plain|color) (default: ansi)
 *   `-a, --arch <arch>`: Limit the push to the specified architecture
 *   `--os <os>`: Limit the push to the specified OS
 *   `--platform <platform>`: Limit the push to the specified platform (format: os/arch[/variant], takes precedence over --os and --arch)
@@ -816,7 +820,32 @@ container volume create [--label <label> ...] [--opt <opt> ...] [-s <s>] [--debu
 
 *   `--label <label>`: Set metadata for a volume
 *   `--opt <opt>`: Set driver specific options
-*   `-s <s>`: Size of the volume in bytes, with optional K, M, G, T, or P suffix
+*   `-s <s>`: Size of the volume in bytes, with optional K, M, G, T, or P suffix. Takes precedence over `--opt size=` if both are specified.
+
+**Driver Options**
+
+Driver options are passed with `--opt key=value`. The following options are supported for the default `local` driver:
+
+*   `size=<value>`: Volume size with optional unit suffix (K, M, G, T, P). Minimum 1 MiB. Equivalent to `-s`; if `-s` is also specified, `-s` takes precedence.
+*   `journal=<mode>[:<size>]`: Configure ext4 journaling on the volume. `<mode>` must be one of:
+    *   `ordered` — journals metadata only; data is written to disk before its metadata is committed (default kernel behavior, good balance of safety and performance)
+    *   `writeback` — journals metadata only; data ordering relative to metadata commits is not guaranteed (fastest, least safe)
+    *   `journal` — journals both metadata and data (safest, highest write amplification)
+
+    An optional `:<size>` suffix sets the journal size (same unit suffixes as `size`). If omitted, the kernel selects a default journal size.
+
+**Examples**
+
+```bash
+# create a volume with ordered journaling
+container volume create --opt journal=ordered myvolume
+
+# create a volume with writeback journaling and a 64 MiB journal
+container volume create --opt journal=writeback:64m myvolume
+
+# create a volume with full data journaling and an explicit volume size
+container volume create --opt journal=journal --opt size=10g myvolume
+```
 
 **Anonymous Volumes**
 
@@ -1033,7 +1062,7 @@ container system version [--format <format>]
 
 **Options**
 
-*   `--format <format>`: Output format (values: json, table; default: table)
+*   `--format <format>`: Output format (values: json, table, yaml; default: table)
 
 **Table Output**
 
@@ -1068,6 +1097,21 @@ Backward-compatible with previous CLI-only output. Top-level fields describe the
     "appName": "container API Server"
   }
 }
+```
+
+**YAML Output**
+
+Equivalent to the JSON output but in YAML format. Each entry in the array represents a component.
+
+```yaml
+- version: 1.2.3
+  buildType: debug
+  commit: abcdef1
+  appName: container
+- version: 1.2.3
+  buildType: release
+  commit: 1234abc
+  appName: container-apiserver
 ```
 
 ### `container system logs`
@@ -1169,118 +1213,25 @@ container system kernel set [--arch <arch>] [--binary <binary>] [--force] [--rec
 
 ### `container system property list (ls)`
 
-Lists all available system properties with their current values, types, and descriptions. Output can be formatted as a table or JSON.
+Lists all system properties with their current values. Output can be formatted as JSON or TOML.
 
 **Usage**
 
 ```bash
-container system property list [--format <format>] [--quiet] [--debug]
+container system property list [--format <format>] [--debug]
 ```
 
 **Options**
 
-*   `--format <format>`: Format of the output (values: json, table; default: table)
-*   `-q, --quiet`: Only output the property ID
+*   `--format <format>`: Format of the output (values: json, toml; default: toml)
 
 **Examples**
 
 ```bash
-# list all properties in table format
+# list all properties in TOML format (default)
 container system property list
-
-# get only property IDs
-container system property list --quiet
 
 # output as JSON for scripting
 container system property list --format json
 ```
 
-### `container system property get`
-
-Retrieves the current value of a specific system property by its ID.
-
-**Usage**
-
-```bash
-container system property get [--debug] <id>
-```
-
-**Arguments**
-
-*   `<id>`: The property ID
-
-**Options**
-
-No options.
-
-**Examples**
-
-```bash
-# get the default registry domain
-container system property get registry.domain
-
-# get the current DNS domain setting
-container system property get dns.domain
-```
-
-### `container system property set`
-
-Sets the value of a system property. The command validates the value based on the property type (boolean, domain name, image reference, URL, or CIDR address).
-
-**Usage**
-
-```bash
-container system property set [--debug] <id> <value>
-```
-
-**Arguments**
-
-*   `<id>`: The property ID
-*   `<value>`: The property value
-
-**Options**
-
-No options.
-
-**Examples**
-
-```bash
-# enable Rosetta for AMD64 builds on ARM64
-container system property set build.rosetta true
-
-# set a custom DNS domain
-container system property set dns.domain mycompany.local
-
-# configure a custom registry
-container system property set registry.domain registry.example.com
-
-# set a custom builder image
-container system property set image.builder myregistry.com/custom-builder:latest
-```
-
-### `container system property clear`
-
-Clears (unsets) a system property, reverting it to its default value.
-
-**Usage**
-
-```bash
-container system property clear [--debug] <id>
-```
-
-**Arguments**
-
-*   `<id>`: The property ID
-
-**Options**
-
-No options.
-
-**Examples**
-
-```bash
-# clear custom DNS domain (revert to default)
-container system property clear dns.domain
-
-# clear custom registry setting
-container system property clear registry.domain

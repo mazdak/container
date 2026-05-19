@@ -16,6 +16,8 @@
 
 import ArgumentParser
 import ContainerAPIClient
+import ContainerPersistence
+import ContainerPlugin
 import Containerization
 import ContainerizationOCI
 import TerminalProgress
@@ -67,23 +69,19 @@ extension Application {
         }
 
         public func run() async throws {
+            let containerSystemConfig: ContainerSystemConfig = try await ConfigurationLoader.load()
             let p = try DefaultPlatform.resolve(platform: platform, os: os, arch: arch, log: log)
 
             let scheme = try RequestScheme(registry.scheme)
 
-            let processedReference = try ClientImage.normalizeReference(reference)
+            let processedReference = try ClientImage.normalizeReference(reference, containerSystemConfig: containerSystemConfig)
 
-            var progressConfig: ProgressConfig
-            switch self.progressFlags.progress {
-            case .none: progressConfig = try ProgressConfig(disableProgressUpdates: true)
-            case .ansi:
-                progressConfig = try ProgressConfig(
-                    showTasks: true,
-                    showItems: true,
-                    ignoreSmallSize: true,
-                    totalTasks: 2
-                )
-            }
+            let progressConfig = try self.progressFlags.makeConfig(
+                showTasks: true,
+                showItems: true,
+                ignoreSmallSize: true,
+                totalTasks: 2
+            )
 
             let progress = ProgressBar(config: progressConfig)
             defer {
@@ -96,7 +94,8 @@ extension Application {
             let taskManager = ProgressTaskCoordinator()
             let fetchTask = await taskManager.startTask()
             let image = try await ClientImage.pull(
-                reference: processedReference, platform: p, scheme: scheme, progressUpdate: ProgressTaskCoordinator.handler(for: fetchTask, from: progress.handler),
+                reference: processedReference, platform: p, scheme: scheme, containerSystemConfig: containerSystemConfig,
+                progressUpdate: ProgressTaskCoordinator.handler(for: fetchTask, from: progress.handler),
                 maxConcurrentDownloads: self.imageFetchFlags.maxConcurrentDownloads
             )
 

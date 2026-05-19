@@ -17,6 +17,7 @@
 import ArgumentParser
 import ContainerAPIClient
 import ContainerResource
+import Containerization
 import ContainerizationError
 import ContainerizationOS
 import Foundation
@@ -56,20 +57,18 @@ extension Application {
         }
 
         public mutating func run() async throws {
-            let set = Set<String>(containerIds)
             let client = ContainerClient()
-            var containers = [ContainerSnapshot]()
+
+            let containers: [String]
             if self.all {
-                containers = try await client.list()
+                containers = try await client.list().map { $0.id }
             } else {
-                containers = try await client.list().filter { c in
-                    set.contains(c.id)
-                }
+                containers = containerIds
             }
 
             let opts = ContainerStopOptions(
                 timeoutInSeconds: self.time,
-                signal: try Signals.parseSignal(self.signal)
+                signal: try Signal(self.signal).rawValue
             )
             try await Self.stopContainers(
                 client: client,
@@ -78,14 +77,14 @@ extension Application {
             )
         }
 
-        static func stopContainers(client: ContainerClient, containers: [ContainerSnapshot], stopOptions: ContainerStopOptions) async throws {
+        static func stopContainers(client: ContainerClient, containers: [String], stopOptions: ContainerStopOptions) async throws {
             var errors: [any Error] = []
             await withTaskGroup(of: (any Error)?.self) { group in
                 for container in containers {
                     group.addTask {
                         do {
-                            try await client.stop(id: container.id, opts: stopOptions)
-                            print(container.id)
+                            try await client.stop(id: container, opts: stopOptions)
+                            print(container)
                             return nil
                         } catch {
                             return error

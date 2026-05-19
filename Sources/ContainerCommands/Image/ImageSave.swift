@@ -16,6 +16,8 @@
 
 import ArgumentParser
 import ContainerAPIClient
+import ContainerPersistence
+import ContainerPlugin
 import ContainerResource
 import Containerization
 import ContainerizationError
@@ -60,6 +62,7 @@ extension Application {
         @Argument var references: [String]
 
         public func run() async throws {
+            let containerSystemConfig: ContainerSystemConfig = try await ConfigurationLoader.load()
             let p = try DefaultPlatform.resolve(platform: platform, os: os, arch: arch, log: log)
 
             let progressConfig = try ProgressConfig(
@@ -74,7 +77,7 @@ extension Application {
             var images: [ImageDescription] = []
             for reference in references {
                 do {
-                    images.append(try await ClientImage.get(reference: reference).description)
+                    images.append(try await ClientImage.get(reference: reference, containerSystemConfig: containerSystemConfig).description)
                 } catch {
                     print("failed to get image for reference \(reference): \(error)")
                 }
@@ -82,6 +85,27 @@ extension Application {
 
             guard images.count == references.count else {
                 throw ContainerizationError(.invalidArgument, message: "failed to save image(s)")
+            }
+
+            if let p {
+                for (reference, description) in zip(references, images) {
+                    let image = ClientImage(description: description)
+                    do {
+                        _ = try await image.manifest(for: p)
+                    } catch {
+                        var available: [String] = []
+                        if let index = try? await image.index() {
+                            available = index.manifests
+                                .compactMap { $0.platform?.description }
+                                .filter { $0 != "unknown/unknown" }
+                        }
+                        let availableStr = available.isEmpty ? "none" : available.joined(separator: ", ")
+                        throw ContainerizationError(
+                            .invalidArgument,
+                            message: "image \(reference) has no content for platform \(p.description); available platforms: \(availableStr)"
+                        )
+                    }
+                }
             }
 
             // Write to stdout; otherwise write to the output file
@@ -95,7 +119,7 @@ extension Application {
                     throw ContainerizationError(.internalError, message: "unable to create temporary file")
                 }
 
-                try await ClientImage.save(references: references, out: tempFile.path(), platform: p)
+                try await ClientImage.save(references: references, out: tempFile.path(), platform: p, containerSystemConfig: containerSystemConfig)
 
                 guard let fileHandle = try? FileHandle(forReadingFrom: tempFile) else {
                     throw ContainerizationError(.internalError, message: "unable to open temporary file for reading")
@@ -109,7 +133,7 @@ extension Application {
                 }
                 try fileHandle.close()
             } else {
-                try await ClientImage.save(references: references, out: output!, platform: p)
+                try await ClientImage.save(references: references, out: output!, platform: p, containerSystemConfig: containerSystemConfig)
             }
 
             progress.finish()

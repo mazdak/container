@@ -90,27 +90,21 @@ public struct Parser {
     public static func resources(
         cpus: Int64?,
         memory: String?,
-        cpuPropertyKey: DefaultsStore.Keys = .defaultContainerCPUs,
-        memoryPropertyKey: DefaultsStore.Keys = .defaultContainerMemory,
-        defaultCPUs: Int = 4,
-        defaultMemoryInBytes: UInt64 = 1024.mib()
+        defaultCPUs: Int,
+        defaultMemory: MemorySize,
     ) throws -> ContainerConfiguration.Resources {
         var resource = ContainerConfiguration.Resources()
         resource.cpus = defaultCPUs
-        resource.memoryInBytes = defaultMemoryInBytes
+        resource.memoryInBytes = Int64(defaultMemory.measurement.converted(to: .mebibytes).value).mib()
 
         if let cpus {
             resource.cpus = Int(cpus)
-        } else if let cpuStr = DefaultsStore.getOptional(key: cpuPropertyKey),
-            let cpuVal = Int(cpuStr), cpuVal > 0
-        {
-            resource.cpus = cpuVal
         }
+
         if let memory {
             resource.memoryInBytes = try Parser.memoryStringAsMiB(memory).mib()
-        } else if let memStr = DefaultsStore.getOptional(key: memoryPropertyKey) {
-            resource.memoryInBytes = try Parser.memoryStringAsMiB(memStr).mib()
         }
+
         return resource
     }
 
@@ -1014,6 +1008,40 @@ public struct Parser {
         }
 
         return parsed
+    }
+
+    // MARK: Capabilities
+
+    /// Parse and validate --cap-add / --cap-drop arguments.
+    /// Returns normalized uppercase CAP_* strings.
+    public static func capabilities(capAdd: [String], capDrop: [String]) throws -> (capAdd: [String], capDrop: [String]) {
+        var normalizedAdd: [String] = []
+        for cap in capAdd {
+            let upper = cap.uppercased()
+            if upper == "ALL" {
+                normalizedAdd.append("ALL")
+                continue
+            }
+            // Validate using CapabilityName from the containerization lib
+            _ = try CapabilityName(rawValue: upper)
+            // Normalize to CAP_ prefixed form
+            let normalized = upper.hasPrefix("CAP_") ? upper : "CAP_\(upper)"
+            normalizedAdd.append(normalized)
+        }
+
+        var normalizedDrop: [String] = []
+        for cap in capDrop {
+            let upper = cap.uppercased()
+            if upper == "ALL" {
+                normalizedDrop.append("ALL")
+                continue
+            }
+            _ = try CapabilityName(rawValue: upper)
+            let normalized = upper.hasPrefix("CAP_") ? upper : "CAP_\(upper)"
+            normalizedDrop.append(normalized)
+        }
+
+        return (normalizedAdd, normalizedDrop)
     }
 
     // MARK: Miscellaneous
